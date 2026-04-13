@@ -31,9 +31,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean
 
 # Copy package manifests and install all dependencies (including dev for build tools)
-# Layer is cached unless package.json changes
+# Layer is cached unless package.json changes.
+#
+# --ignore-scripts prevents Playwright/Patchright/camoufox-js postinstalls from
+# auto-downloading browser binaries during npm install — we do those in explicit
+# later layers for better cache granularity. But we MUST rebuild better-sqlite3
+# (a transitive dep of camoufox-js) because its install script uses prebuild-install
+# to fetch a native .node binding that is otherwise missing.
 COPY package*.json ./
 RUN npm install --no-audit --no-fund --ignore-scripts \
+    && npm rebuild better-sqlite3 \
     && npm cache clean --force
 
 # Download Camoufox browser via camoufox-js (managed binary + GeoIP database)
