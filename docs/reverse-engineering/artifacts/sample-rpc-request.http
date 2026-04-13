@@ -1,0 +1,104 @@
+# AI Studio → Gemini Proxy RPC: 真实成功请求 Capture
+#
+# 来源: 上游 iBUHub/AIStudioToAPI v1.2.1 + Camoufox 运行中,发送一次
+#       POST /v1/chat/completions {model:"gemini-2.5-flash", messages:[{role:"user",content:"hi"}]}
+#       后由 Canvas iframe 内的 index.ts → _aistudio-iframe.js shim → 父 frame 代发出去的请求
+#
+# 捕获手段: Playwright page.on('request') + 'response' (见 src/core/BrowserManager.js 的 DEBUG-PROBE)
+# 捕获时间: 2026-04-13T02:58:28.870Z (请求) / 2026-04-13T02:58:30.362Z (响应)
+# 耗时: ~1.5s
+# 结果: 200 OK, Gemini 返回 "Hi there! How can I help you today?"
+#
+# --- REQUEST ---
+
+POST /$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ProxyUnaryCall HTTP/2
+Host: alkalimakersuite-pa.clients6.google.com
+
+# [静态 / 可复制]
+content-type: application/json+protobuf
+x-user-agent: grpc-web-javascript/0.1
+x-goog-authuser: 0
+origin: https://aistudio.google.com
+referer: https://aistudio.google.com/
+sec-fetch-dest: empty
+sec-fetch-mode: cors
+sec-fetch-site: same-site
+
+# [静态 public key - AI Studio 前端,绑定 referer:aistudio.google.com]
+x-goog-api-key: AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs
+
+# [每次会话独立,来自 IndexedDB 或 sessionStorage; 作用疑为 tracking,未确认必须]
+x-aistudio-visit-id: v1_NTNkZDUxZjUtNGI2NS00OGQxLTllZjUtODMxOWFiNGNkMjc1
+
+# [固定 base64,来自 protobuf flag 序列化; Ext field 519733851; 经验上每个 origin 不变]
+x-goog-ext-519733851-bin: CAASAUIwATgEQABQBFgDYgJVUw==
+
+# [关键:动态签名!每次请求都要重新算]
+# 格式: "SAPISIDHASH <hash> SAPISID1PHASH <hash> SAPISID3PHASH <hash>"
+# 单个 hash 的构造算法:
+#   ts = int(time.time())
+#   hash = sha1(f"{ts} {SAPISID_cookie} {origin}").hexdigest()
+#   field = f"{ts}_{hash}"
+# 三个 field 分别用:
+#   SAPISIDHASH     <- SAPISID cookie
+#   SAPISID1PHASH   <- __Secure-1PAPISID cookie
+#   SAPISID3PHASH   <- __Secure-3PAPISID cookie
+# origin 统一为 "https://aistudio.google.com"
+authorization: SAPISIDHASH 1776049108_b844600b67beb3b90a52166c8683af53b6e0fae0 SAPISID1PHASH 1776049108_b844600b67beb3b90a52166c8683af53b6e0fae0 SAPISID3PHASH 1776049108_b844600b67beb3b90a52166c8683af53b6e0fae0
+
+# [Google 登录态全套 cookie - 必须]
+# SAPISID / 1PAPISID / 3PAPISID 同时参与 SAPISIDHASH 计算
+# 1PSID / 3PSID 用于 session 认证
+# 1PSIDTS / 3PSIDTS 是 session timestamp
+# NID 是 Google 通用 identity cookie
+# SSID / 1PSIDCC / 3PSIDCC 是 session correlation cookies
+cookie: __Secure-1PSIDTS=sidts-CjEBWhotCfOcT1tea90L7ieinEaWzXekg8TmyjaWd15c8-DB-REEOEAOYCN3JZ3Whre2EAA; __Secure-1PSID=g.a0008whsy...0076; SSID=AskknI7kwgbii1LVi; SAPISID=Ju45SLfxOPi4py4-/AmH2sjLxNn55YzGiO; __Secure-1PAPISID=Ju45SLfxOPi4py4-/AmH2sjLxNn55YzGiO; __Secure-3PSIDTS=sidts-CjEBWhotCfOcT1tea90L7ieinEaWzXekg8TmyjaWd15c8-DB-REEOEAOYCN3JZ3Whre2EAA; __Secure-3PAPISID=Ju45SLfxOPi4py4-/AmH2sjLxNn55YzGiO; __Secure-3PSID=g.a0008whsy...0076; NID=530=LWeUTLWnx4SlfmW2...; __Secure-1PSIDCC=AKEyXzWvxEXJLtqO85GxUV20i3Nu-PLnk63ft6O2wijEqvCMbBEMfywSRwCvMSf1A5yv__w2Qas; __Secure-3PSIDCC=AKEyXzVPW6gs1j4uUKFHlN8tFzJApaZoajPNvnE4Gr6tih2FwTG06jWse_4RzZRRRoDgIhkiJw
+
+# [可省略/自动生成]
+user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0
+accept: */*
+accept-encoding: gzip, deflate, br, zstd
+accept-language: en-US,en;q=0.5
+connection: keep-alive
+content-length: 1842
+
+# --- REQUEST BODY ---
+#
+# JSON 数组,长度为 2:
+#   [0] 字符串: 要代发到 generativelanguage.googleapis.com 的路径
+#   [1] 字符串: JSON 序列化后的完整 request body (不是对象!就是一个字符串)
+#
+# 注意 [1] 是 JSON.stringify 包起来的字符串,不是嵌套对象;接收端会再 JSON.parse 一次
+
+[
+  "/v1beta/models/gemini-2.5-flash:generateContent",
+  "{\"contents\":[{\"parts\":[{\"text\":\"hi\"}],\"role\":\"user\"}],\"generationConfig\":{},\"safetySettings\":[{\"category\":\"HARM_CATEGORY_HARASSMENT\",\"threshold\":\"BLOCK_NONE\"},{\"category\":\"HARM_CATEGORY_HATE_SPEECH\",\"threshold\":\"BLOCK_NONE\"},{\"category\":\"HARM_CATEGORY_SEXUALLY_EXPLICIT\",\"threshold\":\"BLOCK_NONE\"},{\"category\":\"HARM_CATEGORY_DANGEROUS_CONTENT\",\"threshold\":\"BLOCK_NONE\"}]}"
+]
+
+# --- RESPONSE ---
+#
+# HTTP/2 200 OK
+# 响应体是 gRPC-Web 的 json+protobuf 格式,外层为数组,内层是被包装过的 Gemini 响应。
+# 上游 build.js 在 _transmitChunk 里把响应分段回传给 Node.js 侧,Node.js 侧再解包成标准 Gemini JSON:
+
+{
+  "candidates": [
+    {
+      "content": {
+        "parts": [ { "text": "Hi there! How can I help you today?" } ],
+        "role": "model"
+      },
+      "finishReason": "STOP",
+      "index": 0
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 2,
+    "candidatesTokenCount": 10,
+    "totalTokenCount": 51,
+    "thoughtsTokenCount": 39,
+    "serviceTier": "SERVICE_TIER_STANDARD"
+  },
+  "modelVersion": "gemini-2.5-flash",
+  "responseId": "1Vvcac_6Ks6Y_uMPp6qZiAU"
+}
