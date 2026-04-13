@@ -5,7 +5,6 @@
  * Author: Ellinav, iBenzene, bbbugg
  */
 
-const CreateAuth = require("../auth/CreateAuth");
 
 /**
  * Auth Routes Manager
@@ -20,7 +19,6 @@ class AuthRoutes {
         this.loginAttempts = new Map(); // Track login attempts for rate limiting
 
         // Initialize auth creation handler
-        this.createAuth = new CreateAuth(serverSystem);
 
         // Rate limiting configuration from environment variables
         this.rateLimitEnabled = process.env.RATE_LIMIT_MAX_ATTEMPTS !== "0";
@@ -38,17 +36,6 @@ class AuthRoutes {
         } else {
             this.logger.info("[Auth] Rate limiting disabled");
         }
-    }
-
-    _rejectIfSystemBusy(res) {
-        if (!this.serverSystem.requestHandler?.isSystemBusy) {
-            return false;
-        }
-
-        return res.status(409).json({
-            error: "System is busy switching or recovering accounts. Please try again later.",
-            message: "systemBusySwitchingOrRecoveringAccounts",
-        });
     }
 
     /**
@@ -235,20 +222,6 @@ class AuthRoutes {
             });
         });
 
-        // VNC-based auth creation routes
-        app.post("/api/vnc/sessions", isAuthenticated, (req, res, next) => {
-            if (this._rejectIfSystemBusy(res)) return;
-            return this.createAuth.startVncSession(req, res, next);
-        });
-        app.post("/api/vnc/auth", isAuthenticated, (req, res, next) => {
-            if (this._rejectIfSystemBusy(res)) return;
-            return this.createAuth.saveAuthFile(req, res, next);
-        });
-        app.delete("/api/vnc/sessions", isAuthenticated, async (req, res) => {
-            this.logger.info("[VNC] Received cleanup request from client (beacon).");
-            await this.createAuth._cleanupVncSession("client_beacon");
-            res.sendStatus(204); // No content
-        });
     }
 
     /**

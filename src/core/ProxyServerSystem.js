@@ -11,7 +11,6 @@ const WebSocket = require("ws");
 const http = require("http");
 const https = require("https");
 const fs = require("fs");
-const net = require("net");
 const path = require("path");
 const { URL } = require("url");
 
@@ -199,13 +198,6 @@ class ProxyServerSystem extends EventEmitter {
 
     _createAuthMiddleware() {
         return (req, res, next) => {
-            // Allow access if session is authenticated (e.g. browser accessing /vnc or API from UI)
-            if (req.session && req.session.isAuthenticated) {
-                if (req.path === "/vnc") {
-                    return next();
-                }
-            }
-
             const serverApiKeys = this.config.apiKeys;
             if (!serverApiKeys || serverApiKeys.length === 0) {
                 return next();
@@ -292,67 +284,10 @@ class ProxyServerSystem extends EventEmitter {
                 return;
             }
 
-            if (pathname === "/vnc") {
-                this.logger.info("[VNC Proxy] Detected VNC WebSocket upgrade request. Verifying session...");
-
-                // Use the session parser from WebRoutes to verify authentication
-                this.webRoutes.sessionParser(req, {}, () => {
-                    if (!req.session || !req.session.isAuthenticated) {
-                        const clientIp = this.webRoutes.authRoutes.getClientIP(req);
-                        this.logger.warn(`[VNC Proxy] Unauthorized WebSocket connection attempt from ${clientIp}`);
-                        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-                        socket.destroy();
-                        return;
-                    }
-
-                    this.logger.info("[VNC Proxy] Session verified. Proxying...");
-                    const target = net.createConnection({ host: "localhost", port: 6080 });
-
-                    target.on("connect", () => {
-                        this.logger.info("[VNC Proxy] Successfully connected to internal websockify (port 6080).");
-
-                        // Forward the WebSocket handshake headers to the backend
-                        const headers = [
-                            `GET ${req.url} HTTP/1.1`,
-                            "Host: localhost:6080",
-                            "Upgrade: websocket",
-                            "Connection: Upgrade",
-                            `Sec-WebSocket-Key: ${req.headers["sec-websocket-key"]}`,
-                            `Sec-WebSocket-Version: ${req.headers["sec-websocket-version"]}`,
-                        ];
-
-                        if (req.headers["sec-websocket-protocol"]) {
-                            headers.push(`Sec-WebSocket-Protocol: ${req.headers["sec-websocket-protocol"]}`);
-                        }
-
-                        if (req.headers["sec-websocket-extensions"]) {
-                            headers.push(`Sec-WebSocket-Extensions: ${req.headers["sec-websocket-extensions"]}`);
-                        }
-
-                        // Write the handshake to the backend
-                        target.write(headers.join("\r\n") + "\r\n\r\n");
-
-                        // Pipe the sockets together. The backend will respond with 101, which goes to the client.
-                        target.pipe(socket).pipe(target);
-                    });
-
-                    target.on("error", err => {
-                        this.logger.error(`[VNC Proxy] Error connecting to internal websockify: ${err.message}`);
-                        socket.destroy();
-                    });
-
-                    socket.on("error", err => {
-                        this.logger.error(`[VNC Proxy] Client socket error: ${err.message}`);
-                        target.destroy();
-                    });
-                });
-            } else {
-                // If it's not for VNC, destroy the socket to prevent hanging connections
-                this.logger.warn(
-                    `[System] Received an upgrade request for an unknown path: ${pathname}. Connection terminated.`
-                );
-                socket.destroy();
-            }
+            this.logger.warn(
+                `[System] Received an upgrade request for an unknown path: ${pathname}. Connection terminated.`
+            );
+            socket.destroy();
         });
 
         this.httpServer.keepAliveTimeout = 120000;
@@ -531,16 +466,6 @@ class ProxyServerSystem extends EventEmitter {
         // Claude API count tokens endpoint
         app.post("/v1/messages/count_tokens", (req, res) => {
             this.requestHandler.processClaudeCountTokens(req, res);
-        });
-
-        // VNC WebSocket downgrade / missing headers handler
-        // If Nginx or another proxy strips "Upgrade: websocket" headers, the request appears as a normal GET.
-        // We intercept it here to prevent it from falling through to the Gemini proxy.
-        app.get("/vnc", (req, res) => {
-            res.status(400).send(
-                "Error: WebSocket connection failed. " +
-                    "If you are using a proxy (like Nginx), ensure it is configured to forward 'Upgrade' and 'Connection' headers."
-            );
         });
 
         // File Upload Routes

@@ -16,6 +16,9 @@ node_modules/
 package-lock.json
 
 # Camoufox browser
+# Legacy Camoufox bundled binary download locations (upstream v1.2.1 used these).
+# camoufox-js now manages its own binary under ~/.cache/camoufox/ and never populates
+# these paths, but we keep them ignored in case someone runs the old setup scripts.
 camoufox/
 camoufox-linux/
 camoufox-macos/

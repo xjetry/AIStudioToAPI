@@ -9,8 +9,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const { firefox, devices } = require("playwright");
-const os = require("os");
+const { firefox } = require("playwright");
 
 // camoufox-js is ESM-only; cached module reference for this process.
 let _camoufoxMod = null;
@@ -1288,61 +1287,6 @@ class BrowserManager {
         } else {
             this.logger.info("[Browser] Background Wakeup Service stopped: unknown reason.");
         }
-    }
-
-    async launchBrowserForVNC(extraArgs = {}) {
-        this.logger.info("🚀 [VNC] Launching a new, separate, headful browser instance for VNC session...");
-
-        const proxyConfig = parseProxyFromEnv();
-        if (proxyConfig) {
-            this.logger.info(`[VNC] 🌐 Using proxy: ${proxyConfig.server}`);
-        }
-
-        // This browser instance is temporary and specific to the VNC session.
-        // It does NOT affect the main `this.browser` used for the API proxy.
-        // Uses camoufox-js to pick up the same Camoufox binary as the main browser.
-        const vncCamouOpts = await _getCamoufoxLaunchOptions({
-            headless: false,  // Must be false for VNC to be visible
-            firefox_user_prefs: this.firefoxUserPrefs,
-            args: this.launchArgs,
-            geoip: true,
-            humanize: true,
-            i_know_what_im_doing: true,
-            ...(this.browserExecutablePath ? { executable_path: this.browserExecutablePath } : {}),
-        });
-        const vncBrowser = await firefox.launch({
-            ...vncCamouOpts,
-            env: {
-                ...(vncCamouOpts.env || process.env),
-                ...extraArgs.env,
-            },
-            ...(proxyConfig ? { proxy: proxyConfig } : {}),
-        });
-
-        vncBrowser.on("disconnected", () => {
-            this.logger.warn("ℹ️ [VNC] The temporary VNC browser instance has been disconnected.");
-        });
-
-        this.logger.info("✅ [VNC] Temporary VNC browser instance launched successfully.");
-
-        let contextOptions = {};
-        if (extraArgs.isMobile) {
-            this.logger.info("[VNC] Mobile device detected. Applying mobile user-agent, viewport, and touch events.");
-            const mobileDevice = devices["Pixel 5"];
-            contextOptions = {
-                hasTouch: mobileDevice.hasTouch,
-                userAgent: mobileDevice.userAgent,
-                viewport: { height: 915, width: 412 }, // Set a specific portrait viewport
-            };
-        }
-
-        const context = await vncBrowser.newContext(
-            proxyConfig ? { ...contextOptions, proxy: proxyConfig } : contextOptions
-        );
-        this.logger.info("✅ [VNC] VNC browser context successfully created.");
-
-        // Return both the browser and context so the caller can manage their lifecycle.
-        return { browser: vncBrowser, context };
     }
 
     /**

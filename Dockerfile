@@ -3,11 +3,9 @@ FROM node:24-slim
 
 WORKDIR /app
 
-# Install system dependencies required for Playwright/Camoufox browser, VNC, and dev tools (git)
+# Install system dependencies required for Camoufox/Chromium browsers (Playwright runtime libs)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    curl \
-    unzip \
     libasound2 \
     libatk-bridge2.0-0 \
     libatk1.0-0 \
@@ -29,9 +27,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrandr2 \
     libxss1 \
     libxtst6 \
-    xvfb \
-    x11vnc \
-    websockify \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -42,8 +37,14 @@ RUN npm install --no-audit --no-fund --ignore-scripts \
     && npm cache clean --force
 
 # Download Camoufox browser via camoufox-js (managed binary + GeoIP database)
-# Cached under /root/.cache/camoufox/ (Linux default for XDG_CACHE_HOME)
+# Cached under /root/.cache/camoufox/ (Linux default for XDG_CACHE_HOME). Used by
+# BrowserManager as the main kernel for API proxying.
 RUN npx camoufox-js fetch
+
+# Download Patchright Chromium binary. Only used by ScreencastAuth for the temporary
+# login browser (separate from the main Camoufox kernel). Needed at runtime when a user
+# initiates web-UI-based Google login via the /auth page.
+RUN npx patchright install chromium
 
 # Copy application source code with proper ownership
 # Layer is rebuilt when source code changes
