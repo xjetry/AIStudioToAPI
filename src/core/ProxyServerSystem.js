@@ -23,6 +23,7 @@ const RequestHandler = require("./RequestHandler");
 const UsageStatsService = require("./UsageStatsService");
 const ConfigLoader = require("../utils/ConfigLoader");
 const WebRoutes = require("../routes/WebRoutes");
+const ScreencastAuth = require("../auth/ScreencastAuth");
 
 /**
  * Proxy Server System
@@ -115,6 +116,7 @@ class ProxyServerSystem extends EventEmitter {
         this.httpServer = null;
         this.wsServer = null;
         this.webRoutes = new WebRoutes(this);
+        this.screencastAuth = new ScreencastAuth(this);
     }
 
     async start(initialAuthIndex = null) {
@@ -269,8 +271,26 @@ class ProxyServerSystem extends EventEmitter {
             this.httpServer = http.createServer(app);
         }
 
-        this.httpServer.on("upgrade", (req, socket) => {
+        this.httpServer.on("upgrade", (req, socket, head) => {
             const pathname = new URL(req.url, `http://${req.headers.host}`).pathname;
+
+            if (pathname === "/screencast") {
+                this.logger.info("[Screencast] Detected WebSocket upgrade request. Verifying session...");
+                this.webRoutes.sessionParser(req, {}, () => {
+                    if (!req.session || !req.session.isAuthenticated) {
+                        const clientIp = this.webRoutes.authRoutes.getClientIP(req);
+                        this.logger.warn(`[Screencast] Unauthorized WebSocket upgrade from ${clientIp}`);
+                        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+                        socket.destroy();
+                        return;
+                    }
+                    const wss = new WebSocket.Server({ noServer: true });
+                    wss.handleUpgrade(req, socket, head, ws => {
+                        this.screencastAuth.handleConnection(ws);
+                    });
+                });
+                return;
+            }
 
             if (pathname === "/vnc") {
                 this.logger.info("[VNC Proxy] Detected VNC WebSocket upgrade request. Verifying session...");
@@ -628,6 +648,11 @@ class ProxyServerSystem extends EventEmitter {
         // Close all message queues
         if (this.connectionRegistry) {
             this.connectionRegistry.closeAllMessageQueues();
+        }
+
+        // Clean up screencast session
+        if (this.screencastAuth) {
+            await this.screencastAuth.cleanup();
         }
 
         // Close browser

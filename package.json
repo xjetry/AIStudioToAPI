@@ -36,6 +36,7 @@
         "express-session": "^1.18.0",
         "jszip": "^3.10.1",
         "mime-types": "^3.0.2",
+        "patchright": "^1.59.4",
         "playwright": "^1.53.1",
         "ws": "^8.17.0"
     },
