@@ -1459,7 +1459,7 @@ class BrowserManager {
         if (this.browser) return;
 
         const proxyConfig = parseProxyFromEnv();
-        this.logger.info("🚀 [Browser] Launching main browser instance...");
+        this.logger.info("🚀 [Browser] Launching main browser instance (Camoufox/Firefox)...");
         if (!fs.existsSync(this.browserExecutablePath)) {
             this._currentAuthIndex = -1;
             throw new Error(`Browser executable not found at path: ${this.browserExecutablePath}`);
@@ -1480,7 +1480,7 @@ class BrowserManager {
             this.browser = null;
             this._cleanupAllContexts();
         });
-        this.logger.info("✅ [Browser] Main browser instance launched successfully.");
+        this.logger.info(`✅ [Browser] Main browser instance launched successfully (${this.browser.version()}).`);
     }
 
     /**
