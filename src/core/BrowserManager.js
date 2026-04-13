@@ -1,6 +1,8 @@
 /**
  * File: src/core/BrowserManager.js
- * Description: Browser manager for launching and controlling headless Firefox instances with authentication contexts
+ * Description: Browser manager for launching and controlling headless Camoufox (patched Firefox)
+ *              instances. Uses camoufox-js (Apify's Node port of Camoufox) as the main kernel;
+ *              it is ESM-only and must be loaded via dynamic import.
  *
  * Author: Ellinav, iBenzene, bbbugg, 挈挈
  */
@@ -9,6 +11,15 @@ const fs = require("fs");
 const path = require("path");
 const { firefox, devices } = require("playwright");
 const os = require("os");
+
+// camoufox-js is ESM-only; cached module reference for this process.
+let _camoufoxMod = null;
+async function _getCamoufoxLaunchOptions(overrides) {
+    if (!_camoufoxMod) {
+        _camoufoxMod = await import("camoufox-js");
+    }
+    return _camoufoxMod.launchOptions(overrides);
+}
 
 const { parseProxyFromEnv } = require("../utils/ProxyUtils");
 const {
@@ -110,27 +121,13 @@ class BrowserManager {
             "toolkit.telemetry.unified": false, // Disable unified telemetry
         };
 
-        if (this.config.browserExecutablePath) {
-            this.browserExecutablePath = this.config.browserExecutablePath;
-        } else {
-            const platform = os.platform();
-            if (platform === "linux") {
-                this.browserExecutablePath = path.join(process.cwd(), "camoufox-linux", "camoufox");
-            } else if (platform === "win32") {
-                this.browserExecutablePath = path.join(process.cwd(), "camoufox", "camoufox.exe");
-            } else if (platform === "darwin") {
-                this.browserExecutablePath = path.join(
-                    process.cwd(),
-                    "camoufox-macos",
-                    "Camoufox.app",
-                    "Contents",
-                    "MacOS",
-                    "camoufox"
-                );
-            } else {
-                throw new Error(`Unsupported operating system: ${platform}`);
-            }
-        }
+        // Browser binary is managed by camoufox-js (downloaded via `npx camoufox-js fetch`
+        // into ~/.cache/camoufox/ on Linux or ~/Library/Caches/camoufox/ on macOS).
+        // The config.browserExecutablePath escape hatch is intentionally preserved for
+        // deployments that want to pin a specific Camoufox binary; when set, it is
+        // forwarded to camoufox-js as `executable_path` — but the binary's parent
+        // directory MUST contain properties.json (not compatible with macOS .app bundles).
+        this.browserExecutablePath = this.config.browserExecutablePath || null;
     }
 
     get currentAuthIndex() {
@@ -1295,9 +1292,6 @@ class BrowserManager {
 
     async launchBrowserForVNC(extraArgs = {}) {
         this.logger.info("🚀 [VNC] Launching a new, separate, headful browser instance for VNC session...");
-        if (!fs.existsSync(this.browserExecutablePath)) {
-            throw new Error(`Browser executable not found at path: ${this.browserExecutablePath}`);
-        }
 
         const proxyConfig = parseProxyFromEnv();
         if (proxyConfig) {
@@ -1306,16 +1300,22 @@ class BrowserManager {
 
         // This browser instance is temporary and specific to the VNC session.
         // It does NOT affect the main `this.browser` used for the API proxy.
-        const vncBrowser = await firefox.launch({
+        // Uses camoufox-js to pick up the same Camoufox binary as the main browser.
+        const vncCamouOpts = await _getCamoufoxLaunchOptions({
+            headless: false,  // Must be false for VNC to be visible
+            firefox_user_prefs: this.firefoxUserPrefs,
             args: this.launchArgs,
+            geoip: true,
+            humanize: true,
+            i_know_what_im_doing: true,
+            ...(this.browserExecutablePath ? { executable_path: this.browserExecutablePath } : {}),
+        });
+        const vncBrowser = await firefox.launch({
+            ...vncCamouOpts,
             env: {
-                ...process.env,
+                ...(vncCamouOpts.env || process.env),
                 ...extraArgs.env,
             },
-            executablePath: this.browserExecutablePath,
-            firefoxUserPrefs: this.firefoxUserPrefs,
-            // Must be false for VNC to be visible.
-            headless: false,
             ...(proxyConfig ? { proxy: proxyConfig } : {}),
         });
 
@@ -1460,15 +1460,22 @@ class BrowserManager {
 
         const proxyConfig = parseProxyFromEnv();
         this.logger.info("🚀 [Browser] Launching main browser instance (Camoufox/Firefox)...");
-        if (!fs.existsSync(this.browserExecutablePath)) {
-            this._currentAuthIndex = -1;
-            throw new Error(`Browser executable not found at path: ${this.browserExecutablePath}`);
-        }
-        this.browser = await firefox.launch({
-            args: this.launchArgs,
-            executablePath: this.browserExecutablePath,
-            firefoxUserPrefs: this.firefoxUserPrefs,
+        // camoufox-js manages its own Camoufox binary under ~/.cache/camoufox/.
+        // It is downloaded on-demand via `npx camoufox-js fetch` during deploy.
+        // Do NOT pass executable_path pointing at a manually-bundled .app bundle —
+        // camoufox-js expects properties.json next to the binary, which differs
+        // from Apple's .app layout.
+        const camouOpts = await _getCamoufoxLaunchOptions({
             headless: true,
+            firefox_user_prefs: this.firefoxUserPrefs,
+            args: this.launchArgs,
+            geoip: true,
+            humanize: true,
+            i_know_what_im_doing: true,
+            ...(this.browserExecutablePath ? { executable_path: this.browserExecutablePath } : {}),
+        });
+        this.browser = await firefox.launch({
+            ...camouOpts,
             ...(proxyConfig ? { proxy: proxyConfig } : {}),
         });
         this.browser.on("disconnected", () => {

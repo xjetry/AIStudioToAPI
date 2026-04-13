@@ -41,30 +41,9 @@ COPY package*.json ./
 RUN npm install --no-audit --no-fund --ignore-scripts \
     && npm cache clean --force
 
-# Download and extract Camoufox browser binary
-# Layer is cached unless CAMOUFOX_URL argument changes
-# Automatically selects architecture-specific binary if URL not provided
-ARG CAMOUFOX_URL
-RUN ARCH=$(uname -m) && \
-    if [ -z "$CAMOUFOX_URL" ]; then \
-    if [ "$ARCH" = "x86_64" ]; then \
-    CAMOUFOX_URL="https://github.com/daijro/camoufox/releases/download/v135.0.1-beta.24/camoufox-135.0.1-beta.24-lin.x86_64.zip"; \
-    elif [ "$ARCH" = "aarch64" ]; then \
-    CAMOUFOX_URL="https://github.com/daijro/camoufox/releases/download/v135.0.1-beta.24/camoufox-135.0.1-beta.24-lin.arm64.zip"; \
-    else \
-    echo "Unsupported architecture: $ARCH" && exit 1; \
-    fi; \
-    fi && \
-    mkdir -p camoufox-linux && \
-    curl -sSL ${CAMOUFOX_URL} -o camoufox.zip && \
-    unzip -q camoufox.zip -d /tmp/cf || true && \
-    if [ -f /tmp/cf/camoufox ]; then \
-    mv /tmp/cf/* camoufox-linux/; \
-    else \
-    mv /tmp/cf/*/* camoufox-linux/; \
-    fi && \
-    rm -rf /tmp/cf camoufox.zip && \
-    chmod +x /app/camoufox-linux/camoufox
+# Download Camoufox browser via camoufox-js (managed binary + GeoIP database)
+# Cached under /root/.cache/camoufox/ (Linux default for XDG_CACHE_HOME)
+RUN npx camoufox-js fetch
 
 # Copy application source code with proper ownership
 # Layer is rebuilt when source code changes
@@ -90,8 +69,11 @@ USER root
 EXPOSE 7860
 
 # Configure runtime environment
-ENV NODE_ENV=production \
-    CAMOUFOX_EXECUTABLE_PATH=/app/camoufox-linux/camoufox
+# Note: Do NOT set CAMOUFOX_EXECUTABLE_PATH or BROWSER_EXECUTABLE_PATH — camoufox-js
+# manages its own binary under ~/.cache/camoufox/ (downloaded via `npx camoufox-js fetch`
+# in the image). Setting an explicit path would require properties.json to sit next to
+# the binary, which the managed layout handles automatically.
+ENV NODE_ENV=production
 
 # Health check for container orchestration platforms
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
