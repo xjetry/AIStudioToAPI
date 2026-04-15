@@ -1965,23 +1965,10 @@ class BrowserManager {
 
             page = await context.newPage();
 
-            // Pure JS Wakeup (Focus & Mouse Movement)
-            // Skip focus operations for background tasks to avoid window focus conflicts
-            if (!isBackgroundTask) {
-                try {
-                    await page.bringToFront();
-                    // eslint-disable-next-line no-undef
-                    await page.evaluate(() => window.focus());
-                    const vp = page.viewportSize() || { height: 1080, width: 1920 };
-                    const startX = Math.floor(Math.random() * (vp.width * 0.5));
-                    const startY = Math.floor(Math.random() * (vp.height * 0.5));
-                    await this._simulateHumanMovement(page, startX, startY);
-                } catch (e) {
-                    this.logger.warn(`[Context#${authIndex}] Wakeup minor error: ${e.message}`);
-                }
-            } else {
-                this.logger.debug(`[Context#${authIndex}] Skipping focus operations for background task`);
-            }
+            // NOTE: Removed bringToFront/window.focus/humanMovement wakeup step.
+            // In headless Camoufox it has no effect, and under parallel batch
+            // initialization it deadlocks: only the last-called page acquires
+            // focus while the earlier ones hang indefinitely before goto.
 
             page.on("console", msg => {
                 const msgText = msg.text();
