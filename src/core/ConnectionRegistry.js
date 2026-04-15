@@ -478,6 +478,53 @@ class ConnectionRegistry extends EventEmitter {
     }
 
     /**
+     * Count in-flight message queues for a specific account.
+     * @param {number} authIndex
+     * @returns {number}
+     */
+    getInflightCountForAuth(authIndex) {
+        let count = 0;
+        for (const entry of this.messageQueues.values()) {
+            if (entry.authIndex === authIndex) count++;
+        }
+        return count;
+    }
+
+    /**
+     * Wait until no in-flight message queues remain for the given account, or the timeout elapses.
+     * Returns the remaining count at resolve time (0 means fully drained).
+     * @param {number} authIndex
+     * @param {number} [timeoutMs=60000]
+     * @param {number} [pollMs=200]
+     * @returns {Promise<{drained: boolean, remaining: number, elapsedMs: number}>}
+     */
+    async waitForAuthDrain(authIndex, timeoutMs = 60000, pollMs = 200) {
+        const start = Date.now();
+        const deadline = start + Math.max(0, timeoutMs);
+        let remaining = this.getInflightCountForAuth(authIndex);
+        if (remaining === 0) {
+            return { drained: true, elapsedMs: 0, remaining: 0 };
+        }
+        this.logger.info(
+            `[Registry] Draining ${remaining} in-flight request(s) for account #${authIndex} (timeout=${timeoutMs}ms)`
+        );
+        while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, pollMs));
+            remaining = this.getInflightCountForAuth(authIndex);
+            if (remaining === 0) {
+                const elapsedMs = Date.now() - start;
+                this.logger.info(`[Registry] Drain complete for account #${authIndex} after ${elapsedMs}ms`);
+                return { drained: true, elapsedMs, remaining: 0 };
+            }
+        }
+        const elapsedMs = Date.now() - start;
+        this.logger.warn(
+            `[Registry] Drain timeout for account #${authIndex}: ${remaining} request(s) still in-flight after ${elapsedMs}ms`
+        );
+        return { drained: false, elapsedMs, remaining };
+    }
+
+    /**
      * Close all message queues belonging to a specific account
      * @param {number} authIndex - The account whose queues should be closed
      * @param {string} [reason="auth_context_closed"] - The reason for closing the queues (e.g., "reconnect_cleanup", "page_closed", "grace_period_timeout")

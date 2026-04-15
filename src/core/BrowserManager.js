@@ -1410,10 +1410,10 @@ class BrowserManager {
         // camoufox-js expects properties.json next to the binary, which differs
         // from Apple's .app layout.
         const camouOpts = await _getCamoufoxLaunchOptions({
-            headless: true,
-            firefox_user_prefs: this.firefoxUserPrefs,
             args: this.launchArgs,
+            firefox_user_prefs: this.firefoxUserPrefs,
             geoip: true,
+            headless: true,
             humanize: true,
             i_know_what_im_doing: true,
             ...(this.browserExecutablePath ? { executable_path: this.browserExecutablePath } : {}),
@@ -1698,12 +1698,18 @@ class BrowserManager {
         }
 
         // Priority 3: Accounts in rotation, from farthest to closest (reverse rotation order)
-        for (let i = orderedFromTarget.length - 1; i >= 0; i--) {
-            const canonical = orderedFromTarget[i];
-            // Find all contexts with this canonical index
-            for (const idx of allContextIndices) {
-                if (this.authSource.getCanonicalIndex(idx) === canonical && !removalPriority.includes(idx)) {
-                    removalPriority.push(idx);
+        // Multi-context mode intentionally SKIPS this step: healthy non-active rotation
+        // contexts must not be evicted just to make room for a new switch target. The pool
+        // is allowed to temporarily exceed maxContexts in that case; the warning below
+        // surfaces the overcommit so operators can tune MAX_CONTEXTS if it becomes chronic.
+        if (maxContexts === 1) {
+            for (let i = orderedFromTarget.length - 1; i >= 0; i--) {
+                const canonical = orderedFromTarget[i];
+                // Find all contexts with this canonical index
+                for (const idx of allContextIndices) {
+                    if (this.authSource.getCanonicalIndex(idx) === canonical && !removalPriority.includes(idx)) {
+                        removalPriority.push(idx);
+                    }
                 }
             }
         }
@@ -1711,12 +1717,18 @@ class BrowserManager {
         // Remove contexts according to priority until we have enough space
         const toRemove = removalPriority.slice(0, removeCount);
 
+        if (toRemove.length < removeCount && maxContexts !== 1) {
+            this.logger.warn(
+                `[ContextPool] Pre-cleanup: only freed ${toRemove.length}/${removeCount} slot(s) for switch to #${targetAuthIndex}; pool will temporarily exceed maxContexts=${maxContexts} to preserve non-active contexts.`
+            );
+        }
+
         this.logger.info(
             `[ContextPool] Pre-cleanup: removing ${toRemove.length} contexts before switch to #${targetAuthIndex}: [${toRemove}] (${this.contexts.size} ready + ${this.initializingContexts.size} initializing)`
         );
 
         for (const idx of toRemove) {
-            await this.closeContext(idx);
+            await this.closeContext(idx, { graceful: true });
         }
     }
 
@@ -1760,6 +1772,12 @@ class BrowserManager {
             currentCanonicalIndex !== null &&
             currentCanonicalIndex !== this._currentAuthIndex;
 
+        // Multi-context limited mode: protect healthy non-active in-rotation contexts.
+        // They must stay alive across rebalances. We only clean up genuinely stale entries
+        // (old duplicates, expired, or deleted accounts) — those are not in rotation directly.
+        const isMultiLimitedMode = !isUnlimited && maxContexts !== 1;
+        const rotationSet = new Set(rotation);
+
         for (const idx of this.contexts.keys()) {
             // Skip current account
             if (idx === this._currentAuthIndex) continue;
@@ -1772,6 +1790,13 @@ class BrowserManager {
 
             // Remove if not in targets
             if (!targets.has(idx)) {
+                // Multi-context limited mode protection: keep in-rotation contexts alive even
+                // if they fall outside the target window. rotationSet contains canonical,
+                // non-expired indices, so old duplicates / expired / deleted accounts still
+                // fall through and get cleaned up.
+                if (isMultiLimitedMode && rotationSet.has(idx)) {
+                    continue;
+                }
                 toRemove.push(idx);
             }
         }
@@ -1794,7 +1819,7 @@ class BrowserManager {
         );
 
         for (const idx of toRemove) {
-            await this.closeContext(idx);
+            await this.closeContext(idx, { graceful: true });
         }
 
         // Preload candidates if we have room in the pool
@@ -2408,14 +2433,50 @@ class BrowserManager {
      * still exists and may trigger unnecessary reconnect attempts.
      *
      * @param {number} authIndex - The auth index to close
+     * @param {object} [options]
+     * @param {boolean} [options.graceful=false] - When true and the pool has room for multiple
+     *     contexts (maxContexts !== 1), wait for any in-flight requests routed to this authIndex
+     *     to drain before tearing down. After the drain budget elapses, fall through to the
+     *     existing force-close path.
+     * @param {number} [options.drainTimeoutMs] - Override the default drain timeout (ms).
      */
-    async closeContext(authIndex) {
+    async closeContext(authIndex, options = {}) {
+        const { drainTimeoutMs, graceful = false } = options;
+
         // If context is being initialized in background, signal abort and wait
         if (this.initializingContexts.has(authIndex)) {
             this.logger.info(`[Browser] Context #${authIndex} is being initialized, marking for abort and waiting...`);
             this.abortedContexts.add(authIndex);
             await this._waitForContextInit(authIndex);
             this.abortedContexts.delete(authIndex);
+        }
+
+        // Graceful drain: only applies when the pool can hold more than one account
+        // (maxContexts === 0 means unlimited, which also qualifies). Skip when the context
+        // is no longer tracked here — nothing to drain.
+        if (graceful && this.contexts.has(authIndex) && this.connectionRegistry && this.config.maxContexts !== 1) {
+            const timeoutMs =
+                typeof drainTimeoutMs === "number" && drainTimeoutMs >= 0
+                    ? drainTimeoutMs
+                    : this.config.contextCloseDrainTimeoutMs;
+            if (timeoutMs > 0) {
+                const inflight = this.connectionRegistry.getInflightCountForAuth(authIndex);
+                if (inflight > 0) {
+                    this.logger.info(
+                        `[Browser] Graceful close for account #${authIndex}: waiting up to ${timeoutMs}ms for ${inflight} in-flight request(s) to finish...`
+                    );
+                    try {
+                        const result = await this.connectionRegistry.waitForAuthDrain(authIndex, timeoutMs);
+                        if (!result.drained) {
+                            this.logger.warn(
+                                `[Browser] Graceful close for account #${authIndex} timed out with ${result.remaining} in-flight request(s) remaining — falling back to force close.`
+                            );
+                        }
+                    } catch (e) {
+                        this.logger.warn(`[Browser] waitForAuthDrain failed for account #${authIndex}: ${e.message}`);
+                    }
+                }
+            }
         }
 
         if (!this.contexts.has(authIndex)) {

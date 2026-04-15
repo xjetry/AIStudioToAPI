@@ -23,6 +23,7 @@ class ConfigLoader {
             apiKeys: [],
             apiKeySource: "Not set",
             browserExecutablePath: null,
+            contextCloseDrainTimeoutMs: 60000,
             enableAuthUpdate: true,
             enableUsageStats: true,
             failureThreshold: 3,
@@ -74,6 +75,12 @@ class ConfigLoader {
         if (process.env.MAX_CONTEXTS) {
             const parsed = parseInt(process.env.MAX_CONTEXTS, 10);
             config.maxContexts = Number.isFinite(parsed) ? Math.max(0, parsed) : config.maxContexts;
+        }
+        if (process.env.CONTEXT_CLOSE_DRAIN_TIMEOUT_MS) {
+            const parsed = parseInt(process.env.CONTEXT_CLOSE_DRAIN_TIMEOUT_MS, 10);
+            config.contextCloseDrainTimeoutMs = Number.isFinite(parsed)
+                ? Math.max(0, parsed)
+                : config.contextCloseDrainTimeoutMs;
         }
         if (process.env.CAMOUFOX_EXECUTABLE_PATH) config.browserExecutablePath = process.env.CAMOUFOX_EXECUTABLE_PATH;
         if (process.env.API_KEYS) {
@@ -166,6 +173,9 @@ class ConfigLoader {
         this.logger.info(`  Auto Update Auth: ${config.enableAuthUpdate}`);
         this.logger.info(`  Usage Stats: ${config.enableUsageStats}`);
         this.logger.info(`  Max Contexts: ${config.maxContexts === 0 ? "Unlimited" : config.maxContexts}`);
+        this.logger.info(
+            `  Context Close Drain Timeout: ${config.contextCloseDrainTimeoutMs > 0 ? `${config.contextCloseDrainTimeoutMs}ms` : "Disabled (force close)"}`
+        );
         this.logger.info(
             `  Usage-based Switch Threshold: ${
                 config.switchOnUses > 0 ? `Switch after every ${config.switchOnUses} requests` : "Disabled"
