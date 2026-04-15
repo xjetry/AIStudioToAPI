@@ -32,31 +32,24 @@ class RequestHandler {
     }
 
     /**
-     * Effective dequeue timeouts for the current moment.
+     * Per-request dequeue timeouts.
      *
-     * When the system is idle (no account switch in progress) we return `0`
-     * for both timers, which MessageQueue.dequeue treats as "wait indefinitely"
-     * — a long-running generation should not be killed by a proxy-side timer.
-     * The queue is still cleaned up via `_setupClientDisconnectHandler` when
-     * the client goes away.
+     * Always `0` (treated by MessageQueue as "wait indefinitely"): the proxy
+     * never kills a healthy in-flight request on its own clock. The only two
+     * places that honor the SWITCH_TIMEOUT_MS deadline are:
      *
-     * When a switch is in progress we return the remaining budget anchored at
-     * the switch trigger moment: every waiter, regardless of when it joined,
-     * will be force-ended no later than `switchStartedAt + switchTimeoutMs`.
-     * If the deadline has already passed we return `1` (≈ immediate reject).
+     * 1. `_waitForSystemReady`, which bounds callers that are *waiting* for a
+     *    switch to finish.
+     * 2. `AuthSwitcher._raceAgainstSwitchDeadline`, which bounds the switch
+     *    operation itself.
+     *
+     * An in-flight `dequeue` is waiting on the browser, not on the switch —
+     * so it is not subject to that deadline. Cleanup for stuck requests is
+     * handled via `_setupClientDisconnectHandler` (closes the queue on client
+     * abort) and via context teardown (closes queues tied to that account).
      */
     get timeouts() {
-        if (!this.authSwitcher.isSystemBusy) {
-            return { FAKE_STREAM: 0, STREAM_CHUNK: 0 };
-        }
-        const startedAt = this.authSwitcher.switchStartedAt;
-        const switchTimeoutMs = this.config.switchTimeoutMs || 120000;
-        if (!startedAt) {
-            return { FAKE_STREAM: switchTimeoutMs, STREAM_CHUNK: switchTimeoutMs };
-        }
-        const remaining = switchTimeoutMs - (Date.now() - startedAt);
-        const effective = remaining > 0 ? remaining : 1;
-        return { FAKE_STREAM: effective, STREAM_CHUNK: effective };
+        return { FAKE_STREAM: 0, STREAM_CHUNK: 0 };
     }
 
     // Delegate properties to AuthSwitcher
