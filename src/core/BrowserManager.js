@@ -1307,8 +1307,9 @@ class BrowserManager {
             poolSize,
             startupOrder.length
         );
+        const parallelLimit = Math.max(1, this.config.startupParallelInitLimit || 3);
         this.logger.info(
-            `🚀 [ContextPool] Starting pool preload (pool=${poolSize}, syncTarget=${syncTarget}, order=[${startupOrder.join(", ")}])...`
+            `🚀 [ContextPool] Starting pool preload (pool=${poolSize}, syncTarget=${syncTarget}, parallelLimit=${parallelLimit}, order=[${startupOrder.join(", ")}])...`
         );
 
         // Abort any existing background preload/rebalance to ensure clean state
@@ -1319,60 +1320,61 @@ class BrowserManager {
             await this._ensureBrowser();
         }
 
-        // Synchronously init accounts until we either hit the sync target or
-        // exhaust the startup order. The first successful init is `firstReady`;
-        // additional successes go into the pool and also count toward the target.
+        // Init accounts in parallel batches until we either hit the sync target
+        // or exhaust the startup order. `firstReady` tracks the first successful
+        // index by startupOrder position — used later to activate the primary context.
         let firstReady = null;
+        let cursor = 0;
 
-        for (let i = 0; i < startupOrder.length; i++) {
-            if (this.contexts.size >= syncTarget) {
-                this.logger.info(
-                    `[ContextPool] Sync preload target reached (${this.contexts.size}/${syncTarget}), stopping sync loop`
-                );
-                break;
-            }
+        const markFirstReady = idx => {
+            if (firstReady === null) firstReady = idx;
+        };
 
-            const authIndex = startupOrder[i];
+        while (this.contexts.size < syncTarget && cursor < startupOrder.length) {
+            // Collect the next batch of fresh accounts to initialize in parallel.
+            const budget = Math.max(0, syncTarget - this.contexts.size);
+            const batchLimit = Math.min(parallelLimit, budget);
+            const batch = [];
 
-            // If already initialized, count it and continue
-            if (this.contexts.has(authIndex)) {
-                this.logger.info(`[ContextPool] Context #${authIndex} already exists, reusing`);
-                if (firstReady === null) firstReady = authIndex;
-                continue;
-            }
+            while (batch.length < batchLimit && cursor < startupOrder.length) {
+                const authIndex = startupOrder[cursor++];
 
-            // If being initialized by another task, wait for it to finish and verify success
-            if (this.initializingContexts.has(authIndex)) {
-                this.logger.info(`[ContextPool] Context #${authIndex} being initialized, waiting...`);
-                await this._waitForContextInit(authIndex);
                 if (this.contexts.has(authIndex)) {
-                    this.logger.info(`[ContextPool] Context #${authIndex} initialized successfully, reusing`);
-                    if (firstReady === null) firstReady = authIndex;
+                    this.logger.info(`[ContextPool] Context #${authIndex} already exists, reusing`);
+                    markFirstReady(authIndex);
                     continue;
                 }
-                this.logger.warn(`[ContextPool] Context #${authIndex} initialization failed, trying next`);
-                continue;
+
+                if (this.initializingContexts.has(authIndex)) {
+                    this.logger.info(`[ContextPool] Context #${authIndex} being initialized elsewhere, skipping`);
+                    continue;
+                }
+
+                batch.push(authIndex);
             }
 
-            this.initializingContexts.add(authIndex);
-            try {
-                this.logger.info(
-                    `[ContextPool] Initializing context #${authIndex}... (${this.contexts.size + 1}/${syncTarget} sync target)`
-                );
-                await this._initializeContext(authIndex);
-                if (firstReady === null) {
-                    firstReady = authIndex;
-                    this.logger.info(`✅ [ContextPool] First context #${authIndex} ready.`);
+            if (batch.length === 0) continue;
+
+            this.logger.info(
+                `[ContextPool] Initializing batch [${batch.join(", ")}] in parallel (${this.contexts.size}/${syncTarget} sync target)`
+            );
+
+            // Reserve init slots BEFORE fanning out so that any concurrent
+            // launchOrSwitchContext call observes them as "in progress".
+            batch.forEach(idx => this.initializingContexts.add(idx));
+
+            const results = await Promise.allSettled(batch.map(idx => this._initializeContext(idx)));
+
+            results.forEach((res, i) => {
+                const idx = batch[i];
+                if (res.status === "fulfilled") {
+                    markFirstReady(idx);
+                    this.logger.info(`✅ [ContextPool] Context #${idx} ready (${this.contexts.size}/${syncTarget}).`);
                 } else {
-                    this.logger.info(
-                        `✅ [ContextPool] Additional startup context #${authIndex} ready (${this.contexts.size}/${syncTarget}).`
-                    );
+                    const reason = res.reason?.message || String(res.reason);
+                    this.logger.error(`❌ [ContextPool] Context #${idx} failed: ${reason}`);
                 }
-            } catch (error) {
-                this.logger.error(`❌ [ContextPool] Context #${authIndex} failed: ${error.message}`);
-            } finally {
-                // Note: _initializeContext already removes from initializingContexts in its finally block
-            }
+            });
         }
 
         if (firstReady === null) {
@@ -1527,9 +1529,11 @@ class BrowserManager {
             `[ContextPool] Background preload starting for [${indices.join(", ")}] (poolCap=${maxPoolSize || "unlimited"})...`
         );
 
+        const parallelLimit = Math.max(1, this.config.startupParallelInitLimit || 3);
         let aborted = false;
+        let cursor = 0;
 
-        for (const authIndex of indices) {
+        while (cursor < indices.length) {
             // Check if abort was requested
             if (this._backgroundPreloadAbort) {
                 this.logger.info(`[ContextPool] Background preload aborted by request`);
@@ -1551,40 +1555,73 @@ class BrowserManager {
                 }
             }
 
-            // Check pool size limit
+            // Check pool size limit — bail out if we've reached it.
             if (maxPoolSize > 0 && this.contexts.size >= maxPoolSize) {
                 this.logger.info(`[ContextPool] Pool size limit reached, stopping preload`);
                 break;
             }
 
-            // Skip if already exists or being initialized by another task
-            if (this.contexts.has(authIndex)) {
-                this.logger.debug(`[ContextPool] Context #${authIndex} already exists, skipping`);
-                continue;
-            }
-            if (this.initializingContexts.has(authIndex)) {
-                this.logger.info(
-                    `[ContextPool] Context #${authIndex} already being initialized by another task, skipping`
-                );
-                continue;
+            // Build the next batch respecting both the parallel limit and the
+            // remaining pool budget. `initializingContexts.size` counts toward
+            // the budget so we don't overshoot while a previous batch is still
+            // settling (shouldn't happen here since batches are awaited, but safe).
+            const remainingSlots =
+                maxPoolSize > 0
+                    ? Math.max(0, maxPoolSize - this.contexts.size - this.initializingContexts.size)
+                    : parallelLimit;
+            const batchLimit = Math.min(parallelLimit, remainingSlots);
+
+            if (batchLimit <= 0) {
+                this.logger.info(`[ContextPool] Pool size limit reached while building batch, stopping preload`);
+                break;
             }
 
-            this.initializingContexts.add(authIndex);
-            try {
-                this.logger.info(`[ContextPool] Background preload init context #${authIndex}...`);
-                await this._initializeContext(authIndex, true); // Mark as background task
-                this.logger.info(`✅ [ContextPool] Background context #${authIndex} ready.`);
-            } catch (error) {
-                // Check if this is an abort error (user deleted the account during initialization or background preload was aborted)
-                const isAbortError = isContextAbortedError(error);
-                if (isAbortError) {
-                    this.logger.info(`[ContextPool] Background context #${authIndex} aborted as requested`);
-                    // If aborted due to background preload abort, mark as aborted
-                    aborted = true;
-                } else {
-                    this.logger.error(`❌ [ContextPool] Background context #${authIndex} failed: ${error.message}`);
+            const batch = [];
+            while (batch.length < batchLimit && cursor < indices.length) {
+                if (this._backgroundPreloadAbort) break;
+                const authIndex = indices[cursor++];
+
+                if (this.contexts.has(authIndex)) {
+                    this.logger.debug(`[ContextPool] Context #${authIndex} already exists, skipping`);
+                    continue;
                 }
+                if (this.initializingContexts.has(authIndex)) {
+                    this.logger.info(
+                        `[ContextPool] Context #${authIndex} already being initialized by another task, skipping`
+                    );
+                    continue;
+                }
+
+                batch.push(authIndex);
             }
+
+            if (batch.length === 0) continue;
+
+            this.logger.info(
+                `[ContextPool] Background preload batch init [${batch.join(", ")}] in parallel (poolCap=${maxPoolSize || "unlimited"})`
+            );
+
+            batch.forEach(idx => this.initializingContexts.add(idx));
+
+            const results = await Promise.allSettled(
+                batch.map(idx => this._initializeContext(idx, true)) // Mark as background task
+            );
+
+            results.forEach((res, i) => {
+                const idx = batch[i];
+                if (res.status === "fulfilled") {
+                    this.logger.info(`✅ [ContextPool] Background context #${idx} ready.`);
+                } else {
+                    const isAbortError = isContextAbortedError(res.reason);
+                    if (isAbortError) {
+                        this.logger.info(`[ContextPool] Background context #${idx} aborted as requested`);
+                        aborted = true;
+                    } else {
+                        const reason = res.reason?.message || String(res.reason);
+                        this.logger.error(`❌ [ContextPool] Background context #${idx} failed: ${reason}`);
+                    }
+                }
+            });
             // Note: initializingContexts and abortedContexts cleanup is handled in _initializeContext's finally block
         }
 

@@ -36,6 +36,7 @@ class ConfigLoader {
             maxContexts: 1,
             maxRetries: 3,
             retryDelay: 2000,
+            startupParallelInitLimit: 3,
             startupSyncPreloadCount: null,
             streamingMode: "real",
             switchOnUses: 40,
@@ -91,6 +92,12 @@ class ConfigLoader {
         if (process.env.STARTUP_SYNC_PRELOAD_COUNT) {
             const parsed = parseInt(process.env.STARTUP_SYNC_PRELOAD_COUNT, 10);
             config.startupSyncPreloadCount = Number.isFinite(parsed) ? Math.max(1, parsed) : null;
+        }
+        if (process.env.STARTUP_PARALLEL_INIT_LIMIT) {
+            const parsed = parseInt(process.env.STARTUP_PARALLEL_INIT_LIMIT, 10);
+            config.startupParallelInitLimit = Number.isFinite(parsed)
+                ? Math.max(1, parsed)
+                : config.startupParallelInitLimit;
         }
         // Default: fill the whole pool at startup. In unlimited mode we fall
         // back to 1 so boot isn't pinned to every available account.
@@ -189,6 +196,7 @@ class ConfigLoader {
         this.logger.info(`  Usage Stats: ${config.enableUsageStats}`);
         this.logger.info(`  Max Contexts: ${config.maxContexts === 0 ? "Unlimited" : config.maxContexts}`);
         this.logger.info(`  Startup Sync Preload Count: ${config.startupSyncPreloadCount}`);
+        this.logger.info(`  Startup Parallel Init Limit: ${config.startupParallelInitLimit}`);
         this.logger.info(
             `  Context Close Drain Timeout: ${config.contextCloseDrainTimeoutMs > 0 ? `${config.contextCloseDrainTimeoutMs}ms` : "Disabled (force close)"}`
         );
