@@ -9,6 +9,18 @@
  * Authentication Switcher Module
  * Handles account switching logic including single/multi-account modes and fallback mechanisms
  */
+/**
+ * Error raised when a switch operation exceeds its configured deadline.
+ * Surfaced by `_raceAgainstSwitchDeadline`.
+ */
+class SwitchDeadlineExceededError extends Error {
+    constructor(deadlineMs) {
+        super(`Switch exceeded ${deadlineMs}ms deadline from trigger`);
+        this.name = "SwitchDeadlineExceededError";
+        this.code = "SWITCH_DEADLINE_EXCEEDED";
+    }
+}
+
 class AuthSwitcher {
     constructor(logger, config, authSource, browserManager) {
         this.logger = logger;
@@ -17,7 +29,8 @@ class AuthSwitcher {
         this.browserManager = browserManager;
         this.failureCount = 0;
         this.usageCount = 0;
-        this.isSystemBusy = false;
+        this._isSystemBusy = false;
+        this._switchStartedAt = null;
     }
 
     get currentAuthIndex() {
@@ -26,6 +39,51 @@ class AuthSwitcher {
 
     set currentAuthIndex(value) {
         this.browserManager.currentAuthIndex = value;
+    }
+
+    /**
+     * `isSystemBusy` doubles as an observable transition marker: every
+     * toggle also records (or clears) `_switchStartedAt`, so the rest of
+     * the system can anchor "time since switch trigger" without each
+     * caller having to remember to record it.
+     */
+    get isSystemBusy() {
+        return this._isSystemBusy;
+    }
+
+    set isSystemBusy(value) {
+        const next = Boolean(value);
+        if (next === this._isSystemBusy) return;
+        this._isSystemBusy = next;
+        this._switchStartedAt = next ? Date.now() : null;
+    }
+
+    get switchStartedAt() {
+        return this._switchStartedAt;
+    }
+
+    /**
+     * Run the switch body under a hard deadline. On timeout the promise
+     * rejects with `SwitchDeadlineExceededError`; the underlying work may
+     * still run to completion in the background (best-effort), but callers
+     * and waiters treat the switch as force-ended.
+     * @param {() => Promise<T>} workFn
+     * @returns {Promise<T>}
+     * @template T
+     */
+    async _raceAgainstSwitchDeadline(workFn) {
+        const deadlineMs = Math.max(1000, this.config.switchTimeoutMs || 120000);
+        let deadlineTimerId = null;
+        const deadlinePromise = new Promise((_, reject) => {
+            deadlineTimerId = setTimeout(() => {
+                reject(new SwitchDeadlineExceededError(deadlineMs));
+            }, deadlineMs);
+        });
+        try {
+            return await Promise.race([workFn(), deadlinePromise]);
+        } finally {
+            if (deadlineTimerId) clearTimeout(deadlineTimerId);
+        }
     }
 
     // getNextAuthIndex() {
@@ -64,145 +122,154 @@ class AuthSwitcher {
         this.isSystemBusy = true;
 
         try {
-            // Single account mode
-            if (available.length === 1) {
-                const singleIndex = available[0];
-                this.logger.info("==================================================");
-                this.logger.info(
-                    `🔄 [Auth] Single account mode: Rotation threshold reached, performing in-place restart...`
-                );
-                this.logger.info(`   • Target account: #${singleIndex}`);
-                this.logger.info("==================================================");
-
-                try {
-                    await this.browserManager.launchOrSwitchContext(singleIndex);
-                    this.resetCounters();
-                    this.browserManager.rebalanceContextPool().catch(err => {
-                        this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
-                    });
-
+            return await this._raceAgainstSwitchDeadline(async () => {
+                // Single account mode
+                if (available.length === 1) {
+                    const singleIndex = available[0];
+                    this.logger.info("==================================================");
                     this.logger.info(
-                        `✅ [Auth] Single account #${singleIndex} restart/refresh successful, usage count reset.`
+                        `🔄 [Auth] Single account mode: Rotation threshold reached, performing in-place restart...`
                     );
-                    return { newIndex: singleIndex, success: true };
-                } catch (error) {
-                    this.logger.error(`❌ [Auth] Single account restart failed: ${error.message}`);
-                    throw new Error(`Only one account is available and restart failed: ${error.message}`);
-                }
-            }
+                    this.logger.info(`   • Target account: #${singleIndex}`);
+                    this.logger.info("==================================================");
 
-            // Multi-account mode
-            const currentCanonicalIndex =
-                this.currentAuthIndex >= 0
-                    ? this.authSource.getCanonicalIndex(this.currentAuthIndex)
-                    : this.currentAuthIndex;
-            const currentIndexInArray = available.indexOf(currentCanonicalIndex);
-            const hasCurrentAccount = currentIndexInArray !== -1;
-            const startIndex = hasCurrentAccount ? currentIndexInArray : 0;
-            const originalStartAccount = hasCurrentAccount ? available[startIndex] : null;
+                    try {
+                        await this.browserManager.launchOrSwitchContext(singleIndex);
+                        this.resetCounters();
+                        this.browserManager.rebalanceContextPool().catch(err => {
+                            this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
+                        });
 
-            this.logger.info("==================================================");
-            this.logger.info(`🔄 [Auth] Multi-account mode: Starting intelligent account switching`);
-            this.logger.info(`   • Current account: #${this.currentAuthIndex}`);
-            this.logger.info(
-                `   • Available accounts (dedup by email, keeping latest index): [${available.join(", ")}]`
-            );
-            if (hasCurrentAccount) {
-                this.logger.info(`   • Starting from: #${originalStartAccount}`);
-            } else {
-                this.logger.info(`   • No current account, will try all available accounts`);
-            }
-            this.logger.info("==================================================");
-
-            const failedAccounts = [];
-            // If no current account (currentAuthIndex=-1), start from i=0 to try all accounts
-            // If has current account, start from i=1 to skip current and try others
-            const startOffset = hasCurrentAccount ? 1 : 0;
-            const tryCount = hasCurrentAccount ? available.length - 1 : available.length;
-
-            for (let i = startOffset; i < startOffset + tryCount; i++) {
-                const tryIndex = (startIndex + i) % available.length;
-                const accountIndex = available[tryIndex];
-
-                const attemptNumber = i - startOffset + 1;
-                this.logger.info(
-                    `🔄 [Auth] Attempting to switch to account #${accountIndex} (${attemptNumber}/${tryCount} accounts)...`
-                );
-
-                try {
-                    // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
-                    await this.browserManager.preCleanupForSwitch(accountIndex);
-                    await this.browserManager.switchAccount(accountIndex);
-                    this.resetCounters();
-                    this.browserManager.rebalanceContextPool().catch(err => {
-                        this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
-                    });
-
-                    if (failedAccounts.length > 0) {
                         this.logger.info(
-                            `✅ [Auth] Successfully switched to account #${accountIndex} after skipping failed accounts: [${failedAccounts.join(", ")}]`
+                            `✅ [Auth] Single account #${singleIndex} restart/refresh successful, usage count reset.`
                         );
-                    } else {
+                        return { newIndex: singleIndex, success: true };
+                    } catch (error) {
+                        this.logger.error(`❌ [Auth] Single account restart failed: ${error.message}`);
+                        throw new Error(`Only one account is available and restart failed: ${error.message}`);
+                    }
+                }
+
+                // Multi-account mode
+                const currentCanonicalIndex =
+                    this.currentAuthIndex >= 0
+                        ? this.authSource.getCanonicalIndex(this.currentAuthIndex)
+                        : this.currentAuthIndex;
+                const currentIndexInArray = available.indexOf(currentCanonicalIndex);
+                const hasCurrentAccount = currentIndexInArray !== -1;
+                const startIndex = hasCurrentAccount ? currentIndexInArray : 0;
+                const originalStartAccount = hasCurrentAccount ? available[startIndex] : null;
+
+                this.logger.info("==================================================");
+                this.logger.info(`🔄 [Auth] Multi-account mode: Starting intelligent account switching`);
+                this.logger.info(`   • Current account: #${this.currentAuthIndex}`);
+                this.logger.info(
+                    `   • Available accounts (dedup by email, keeping latest index): [${available.join(", ")}]`
+                );
+                if (hasCurrentAccount) {
+                    this.logger.info(`   • Starting from: #${originalStartAccount}`);
+                } else {
+                    this.logger.info(`   • No current account, will try all available accounts`);
+                }
+                this.logger.info("==================================================");
+
+                const failedAccounts = [];
+                // If no current account (currentAuthIndex=-1), start from i=0 to try all accounts
+                // If has current account, start from i=1 to skip current and try others
+                const startOffset = hasCurrentAccount ? 1 : 0;
+                const tryCount = hasCurrentAccount ? available.length - 1 : available.length;
+
+                for (let i = startOffset; i < startOffset + tryCount; i++) {
+                    const tryIndex = (startIndex + i) % available.length;
+                    const accountIndex = available[tryIndex];
+
+                    const attemptNumber = i - startOffset + 1;
+                    this.logger.info(
+                        `🔄 [Auth] Attempting to switch to account #${accountIndex} (${attemptNumber}/${tryCount} accounts)...`
+                    );
+
+                    try {
+                        // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
+                        await this.browserManager.preCleanupForSwitch(accountIndex);
+                        await this.browserManager.switchAccount(accountIndex);
+                        this.resetCounters();
+                        this.browserManager.rebalanceContextPool().catch(err => {
+                            this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
+                        });
+
+                        if (failedAccounts.length > 0) {
+                            this.logger.info(
+                                `✅ [Auth] Successfully switched to account #${accountIndex} after skipping failed accounts: [${failedAccounts.join(", ")}]`
+                            );
+                        } else {
+                            this.logger.info(
+                                `✅ [Auth] Successfully switched to account #${accountIndex}, counters reset.`
+                            );
+                        }
+
+                        return { failedAccounts, newIndex: accountIndex, success: true };
+                    } catch (error) {
+                        this.logger.error(`❌ [Auth] Account #${accountIndex} failed: ${error.message}`);
+                        failedAccounts.push(accountIndex);
+                    }
+                }
+
+                // If we had a current account, try it as a final fallback
+                // If we had no current account, we already tried all accounts, so skip fallback
+                if (hasCurrentAccount && originalStartAccount !== null) {
+                    this.logger.warn("==================================================");
+                    this.logger.warn(
+                        `⚠️ [Auth] All other accounts failed. Making final attempt with original starting account #${originalStartAccount}...`
+                    );
+                    this.logger.warn("==================================================");
+
+                    try {
+                        // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
+                        await this.browserManager.preCleanupForSwitch(originalStartAccount);
+                        await this.browserManager.switchAccount(originalStartAccount);
+                        this.resetCounters();
+                        this.browserManager.rebalanceContextPool().catch(err => {
+                            this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
+                        });
                         this.logger.info(
-                            `✅ [Auth] Successfully switched to account #${accountIndex}, counters reset.`
+                            `✅ [Auth] Final attempt succeeded! Switched to account #${originalStartAccount}.`
+                        );
+                        return {
+                            failedAccounts,
+                            finalAttempt: true,
+                            newIndex: originalStartAccount,
+                            success: true,
+                        };
+                    } catch (finalError) {
+                        this.logger.error(
+                            `FATAL: ❌❌❌ [Auth] Final attempt with account #${originalStartAccount} also failed!`
+                        );
+                        failedAccounts.push(originalStartAccount);
+
+                        // Throw fallback failure error with detailed information
+                        this.currentAuthIndex = -1;
+                        throw new Error(
+                            `Fallback failed reason: All accounts failed including fallback to #${originalStartAccount}. Failed accounts: [${failedAccounts.join(", ")}]`
                         );
                     }
-
-                    return { failedAccounts, newIndex: accountIndex, success: true };
-                } catch (error) {
-                    this.logger.error(`❌ [Auth] Account #${accountIndex} failed: ${error.message}`);
-                    failedAccounts.push(accountIndex);
                 }
-            }
 
-            // If we had a current account, try it as a final fallback
-            // If we had no current account, we already tried all accounts, so skip fallback
-            if (hasCurrentAccount && originalStartAccount !== null) {
-                this.logger.warn("==================================================");
-                this.logger.warn(
-                    `⚠️ [Auth] All other accounts failed. Making final attempt with original starting account #${originalStartAccount}...`
+                // All accounts failed
+                this.logger.error(
+                    `FATAL: All ${available.length} accounts failed! Failed accounts: [${failedAccounts.join(", ")}]`
                 );
-                this.logger.warn("==================================================");
-
-                try {
-                    // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
-                    await this.browserManager.preCleanupForSwitch(originalStartAccount);
-                    await this.browserManager.switchAccount(originalStartAccount);
-                    this.resetCounters();
-                    this.browserManager.rebalanceContextPool().catch(err => {
-                        this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
-                    });
-                    this.logger.info(
-                        `✅ [Auth] Final attempt succeeded! Switched to account #${originalStartAccount}.`
-                    );
-                    return {
-                        failedAccounts,
-                        finalAttempt: true,
-                        newIndex: originalStartAccount,
-                        success: true,
-                    };
-                } catch (finalError) {
-                    this.logger.error(
-                        `FATAL: ❌❌❌ [Auth] Final attempt with account #${originalStartAccount} also failed!`
-                    );
-                    failedAccounts.push(originalStartAccount);
-
-                    // Throw fallback failure error with detailed information
-                    this.currentAuthIndex = -1;
-                    throw new Error(
-                        `Fallback failed reason: All accounts failed including fallback to #${originalStartAccount}. Failed accounts: [${failedAccounts.join(", ")}]`
-                    );
-                }
+                this.currentAuthIndex = -1;
+                throw new Error(
+                    `Switching to account failed: All ${available.length} available accounts failed to initialize. Failed accounts: [${failedAccounts.join(", ")}]`
+                );
+            });
+        } catch (error) {
+            if (error instanceof SwitchDeadlineExceededError) {
+                this.logger.error(
+                    `⏱️ [Auth] Switch to next account force-ended: ${error.message}. Dangling work (if any) may still run in the background.`
+                );
             }
-
-            // All accounts failed
-            this.logger.error(
-                `FATAL: All ${available.length} accounts failed! Failed accounts: [${failedAccounts.join(", ")}]`
-            );
-            this.currentAuthIndex = -1;
-            throw new Error(
-                `Switching to account failed: All ${available.length} available accounts failed to initialize. Failed accounts: [${failedAccounts.join(", ")}]`
-            );
+            throw error;
         } finally {
             this.isSystemBusy = false;
         }
@@ -225,18 +292,26 @@ class AuthSwitcher {
 
         this.isSystemBusy = true;
         try {
-            this.logger.info(`🔄 [Auth] Starting switch to specified account #${targetIndex}...`);
-            // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
-            await this.browserManager.preCleanupForSwitch(targetIndex);
-            await this.browserManager.switchAccount(targetIndex);
-            this.resetCounters();
-            this.browserManager.rebalanceContextPool().catch(err => {
-                this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
+            return await this._raceAgainstSwitchDeadline(async () => {
+                this.logger.info(`🔄 [Auth] Starting switch to specified account #${targetIndex}...`);
+                // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
+                await this.browserManager.preCleanupForSwitch(targetIndex);
+                await this.browserManager.switchAccount(targetIndex);
+                this.resetCounters();
+                this.browserManager.rebalanceContextPool().catch(err => {
+                    this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
+                });
+                this.logger.info(`✅ [Auth] Successfully switched to account #${targetIndex}, counters reset.`);
+                return { newIndex: targetIndex, success: true };
             });
-            this.logger.info(`✅ [Auth] Successfully switched to account #${targetIndex}, counters reset.`);
-            return { newIndex: targetIndex, success: true };
         } catch (error) {
-            this.logger.error(`❌ [Auth] Switch to specified account #${targetIndex} failed: ${error.message}`);
+            if (error instanceof SwitchDeadlineExceededError) {
+                this.logger.error(
+                    `⏱️ [Auth] Switch to specified account #${targetIndex} force-ended: ${error.message}. Dangling work (if any) may still run in the background.`
+                );
+            } else {
+                this.logger.error(`❌ [Auth] Switch to specified account #${targetIndex} failed: ${error.message}`);
+            }
             throw error;
         } finally {
             this.isSystemBusy = false;

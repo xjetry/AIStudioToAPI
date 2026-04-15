@@ -14,12 +14,6 @@ const FormatConverter = require("./FormatConverter");
 const { isUserAbortedError } = require("../utils/CustomErrors");
 const { QueueClosedError, QueueTimeoutError } = require("../utils/MessageQueue");
 
-// Timeout constants (in milliseconds)
-const TIMEOUTS = {
-    FAKE_STREAM: 300000, // 300 seconds (5 minutes) - timeout for fake streaming (buffered response)
-    STREAM_CHUNK: 60000, // 60 seconds - timeout between stream chunks
-};
-
 class RequestHandler {
     constructor(serverSystem, connectionRegistry, logger, browserManager, config, authSource) {
         this.serverSystem = serverSystem;
@@ -35,9 +29,34 @@ class RequestHandler {
 
         this.maxRetries = this.config.maxRetries;
         this.retryDelay = this.config.retryDelay;
+    }
 
-        // Timeout settings
-        this.timeouts = TIMEOUTS;
+    /**
+     * Effective dequeue timeouts for the current moment.
+     *
+     * When the system is idle (no account switch in progress) we return `0`
+     * for both timers, which MessageQueue.dequeue treats as "wait indefinitely"
+     * — a long-running generation should not be killed by a proxy-side timer.
+     * The queue is still cleaned up via `_setupClientDisconnectHandler` when
+     * the client goes away.
+     *
+     * When a switch is in progress we return the remaining budget anchored at
+     * the switch trigger moment: every waiter, regardless of when it joined,
+     * will be force-ended no later than `switchStartedAt + switchTimeoutMs`.
+     * If the deadline has already passed we return `1` (≈ immediate reject).
+     */
+    get timeouts() {
+        if (!this.authSwitcher.isSystemBusy) {
+            return { FAKE_STREAM: 0, STREAM_CHUNK: 0 };
+        }
+        const startedAt = this.authSwitcher.switchStartedAt;
+        const switchTimeoutMs = this.config.switchTimeoutMs || 120000;
+        if (!startedAt) {
+            return { FAKE_STREAM: switchTimeoutMs, STREAM_CHUNK: switchTimeoutMs };
+        }
+        const remaining = switchTimeoutMs - (Date.now() - startedAt);
+        const effective = remaining > 0 ? remaining : 1;
+        return { FAKE_STREAM: effective, STREAM_CHUNK: effective };
     }
 
     // Delegate properties to AuthSwitcher
@@ -507,31 +526,51 @@ class RequestHandler {
     }
 
     /**
-     * Wait for system to become ready (not busy with switching/recovery)
-     * @param {number} [timeoutMs] - Maximum time to wait in milliseconds.
-     *     Defaults to `config.systemBusyWaitTimeoutMs` (env: `SYSTEM_BUSY_WAIT_TIMEOUT_MS`,
-     *     default 120000ms).
-     * @returns {Promise<boolean>} true if system becomes ready, false if timeout
+     * Wait for the system to become ready (no active switch/recovery).
+     *
+     * The deadline is anchored at the *switch trigger* moment rather than at
+     * this call, so every waiter — old or new — is released no later than
+     * `switchStartedAt + switchTimeoutMs` (env: `SWITCH_TIMEOUT_MS`, default
+     * 120000ms). That way a single hung switch cannot starve late arrivals
+     * beyond its own deadline.
+     *
+     * @returns {Promise<boolean>} true if system becomes ready, false if the
+     *     switch deadline was reached first.
      */
-    async _waitForSystemReady(timeoutMs = this.config.systemBusyWaitTimeoutMs) {
+    async _waitForSystemReady() {
         if (!this.authSwitcher.isSystemBusy) {
             return true;
         }
 
-        this.logger.info(`[System] System is busy (switching/recovering), waiting up to ${timeoutMs / 1000}s...`);
+        const switchTimeoutMs = this.config.switchTimeoutMs || 120000;
+        const startedAt = this.authSwitcher.switchStartedAt ?? Date.now();
+        const deadline = startedAt + switchTimeoutMs;
+        const waitStart = Date.now();
+        const remainingAtEntry = deadline - waitStart;
 
-        const startTime = Date.now();
+        if (remainingAtEntry <= 0) {
+            this.logger.warn(
+                `[System] Switch already past ${switchTimeoutMs}ms deadline (elapsed ${waitStart - startedAt}ms); rejecting wait immediately.`
+            );
+            return false;
+        }
+
+        this.logger.info(
+            `[System] System is busy (switching/recovering), waiting up to ${Math.round(remainingAtEntry / 1000)}s (switch started ${waitStart - startedAt}ms ago, hard deadline ${switchTimeoutMs}ms)...`
+        );
+
         const checkInterval = 200; // Check every 200ms
-
-        while (Date.now() - startTime < timeoutMs) {
+        while (Date.now() < deadline) {
             if (!this.authSwitcher.isSystemBusy) {
-                this.logger.info(`[System] System ready after ${Date.now() - startTime}ms.`);
+                this.logger.info(`[System] System ready after ${Date.now() - waitStart}ms.`);
                 return true;
             }
             await new Promise(resolve => setTimeout(resolve, checkInterval));
         }
 
-        this.logger.warn(`[System] Timeout waiting for system after ${timeoutMs}ms.`);
+        this.logger.warn(
+            `[System] Switch deadline exceeded (${Date.now() - startedAt}ms since trigger, limit ${switchTimeoutMs}ms). Forcing wait to end.`
+        );
         return false;
     }
 
