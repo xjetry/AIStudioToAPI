@@ -36,6 +36,7 @@ class ConfigLoader {
             maxContexts: 1,
             maxRetries: 3,
             retryDelay: 2000,
+            startupSyncPreloadCount: null,
             streamingMode: "real",
             switchOnUses: 40,
             switchTimeoutMs: 120000,
@@ -86,6 +87,15 @@ class ConfigLoader {
         if (process.env.SWITCH_TIMEOUT_MS) {
             const parsed = parseInt(process.env.SWITCH_TIMEOUT_MS, 10);
             config.switchTimeoutMs = Number.isFinite(parsed) ? Math.max(1000, parsed) : config.switchTimeoutMs;
+        }
+        if (process.env.STARTUP_SYNC_PRELOAD_COUNT) {
+            const parsed = parseInt(process.env.STARTUP_SYNC_PRELOAD_COUNT, 10);
+            config.startupSyncPreloadCount = Number.isFinite(parsed) ? Math.max(1, parsed) : null;
+        }
+        // Default: fill the whole pool at startup. In unlimited mode we fall
+        // back to 1 so boot isn't pinned to every available account.
+        if (config.startupSyncPreloadCount === null || config.startupSyncPreloadCount === undefined) {
+            config.startupSyncPreloadCount = config.maxContexts > 0 ? config.maxContexts : 1;
         }
         if (process.env.CAMOUFOX_EXECUTABLE_PATH) config.browserExecutablePath = process.env.CAMOUFOX_EXECUTABLE_PATH;
         if (process.env.API_KEYS) {
@@ -178,6 +188,7 @@ class ConfigLoader {
         this.logger.info(`  Auto Update Auth: ${config.enableAuthUpdate}`);
         this.logger.info(`  Usage Stats: ${config.enableUsageStats}`);
         this.logger.info(`  Max Contexts: ${config.maxContexts === 0 ? "Unlimited" : config.maxContexts}`);
+        this.logger.info(`  Startup Sync Preload Count: ${config.startupSyncPreloadCount}`);
         this.logger.info(
             `  Context Close Drain Timeout: ${config.contextCloseDrainTimeoutMs > 0 ? `${config.contextCloseDrainTimeoutMs}ms` : "Disabled (force close)"}`
         );

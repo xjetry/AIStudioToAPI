@@ -1298,8 +1298,17 @@ class BrowserManager {
      */
     async preloadContextPool(startupOrder, maxContexts) {
         const poolSize = maxContexts === 0 ? startupOrder.length : Math.min(maxContexts, startupOrder.length);
+        // How many contexts to bring up synchronously before the system starts
+        // accepting traffic. Defaults to the full pool so the user doesn't have
+        // to rely on the background preload to eventually catch up.
+        const configuredSync = this.config.startupSyncPreloadCount;
+        const syncTarget = Math.min(
+            typeof configuredSync === "number" && configuredSync > 0 ? configuredSync : poolSize,
+            poolSize,
+            startupOrder.length
+        );
         this.logger.info(
-            `🚀 [ContextPool] Starting pool preload (pool=${poolSize}, order=[${startupOrder.join(", ")}])...`
+            `🚀 [ContextPool] Starting pool preload (pool=${poolSize}, syncTarget=${syncTarget}, order=[${startupOrder.join(", ")}])...`
         );
 
         // Abort any existing background preload/rebalance to ensure clean state
@@ -1310,17 +1319,26 @@ class BrowserManager {
             await this._ensureBrowser();
         }
 
-        // Synchronously try ALL indices until one succeeds (fallback beyond poolSize)
+        // Synchronously init accounts until we either hit the sync target or
+        // exhaust the startup order. The first successful init is `firstReady`;
+        // additional successes go into the pool and also count toward the target.
         let firstReady = null;
 
         for (let i = 0; i < startupOrder.length; i++) {
+            if (this.contexts.size >= syncTarget) {
+                this.logger.info(
+                    `[ContextPool] Sync preload target reached (${this.contexts.size}/${syncTarget}), stopping sync loop`
+                );
+                break;
+            }
+
             const authIndex = startupOrder[i];
 
-            // If already initialized, use it directly
+            // If already initialized, count it and continue
             if (this.contexts.has(authIndex)) {
                 this.logger.info(`[ContextPool] Context #${authIndex} already exists, reusing`);
-                firstReady = authIndex;
-                break;
+                if (firstReady === null) firstReady = authIndex;
+                continue;
             }
 
             // If being initialized by another task, wait for it to finish and verify success
@@ -1329,8 +1347,8 @@ class BrowserManager {
                 await this._waitForContextInit(authIndex);
                 if (this.contexts.has(authIndex)) {
                     this.logger.info(`[ContextPool] Context #${authIndex} initialized successfully, reusing`);
-                    firstReady = authIndex;
-                    break;
+                    if (firstReady === null) firstReady = authIndex;
+                    continue;
                 }
                 this.logger.warn(`[ContextPool] Context #${authIndex} initialization failed, trying next`);
                 continue;
@@ -1338,11 +1356,18 @@ class BrowserManager {
 
             this.initializingContexts.add(authIndex);
             try {
-                this.logger.info(`[ContextPool] Initializing context #${authIndex}...`);
+                this.logger.info(
+                    `[ContextPool] Initializing context #${authIndex}... (${this.contexts.size + 1}/${syncTarget} sync target)`
+                );
                 await this._initializeContext(authIndex);
-                firstReady = authIndex;
-                this.logger.info(`✅ [ContextPool] First context #${authIndex} ready.`);
-                break;
+                if (firstReady === null) {
+                    firstReady = authIndex;
+                    this.logger.info(`✅ [ContextPool] First context #${authIndex} ready.`);
+                } else {
+                    this.logger.info(
+                        `✅ [ContextPool] Additional startup context #${authIndex} ready (${this.contexts.size}/${syncTarget}).`
+                    );
+                }
             } catch (error) {
                 this.logger.error(`❌ [ContextPool] Context #${authIndex} failed: ${error.message}`);
             } finally {
@@ -1358,6 +1383,13 @@ class BrowserManager {
         // Early return if pool size is 1 (single context mode) - no need for background preload
         if (poolSize === 1) {
             this.logger.info(`[ContextPool] Single context mode (maxContexts=1), skipping background preload.`);
+            return { firstReady };
+        }
+
+        if (this.contexts.size >= poolSize) {
+            this.logger.info(
+                `[ContextPool] Sync preload filled pool (${this.contexts.size}/${poolSize}), skipping background preload.`
+            );
             return { firstReady };
         }
 
@@ -1570,19 +1602,26 @@ class BrowserManager {
         const maxContexts = this.config.maxContexts;
         const isUnlimited = maxContexts === 0;
 
-        // Abort any ongoing background preload task before cleanup
-        // This prevents race conditions where background tasks continue initializing contexts
-        // that will be immediately removed by the new rebalance after switch
-        await this.abortBackgroundPreload();
+        // Abort the background preload ONLY in single-context mode. In multi-context
+        // mode the preload's work is valuable — the contexts it is initializing are
+        // protected from eviction (see the priority-3 skip and rebalance protection
+        // below), so killing it wastes browser setup work and has historically
+        // produced orphaned `initializingContexts` entries that blocked every
+        // subsequent switch with a fatal pre-cleanup assertion.
+        if (maxContexts === 1) {
+            await this.abortBackgroundPreload();
+        }
 
-        // Test: Check if initializingContexts is empty after aborting background task
+        // Defensive: if any orphaned entries remain in `initializingContexts`
+        // (stuck `_initializeContext` that never saw the abort signal, finished
+        // without cleaning up, etc.), log them and proceed. The downstream
+        // switch logic already handles "initializing" entries via
+        // `_waitForContextInit` with its own 120s timeout, so a stale entry
+        // degrades gracefully instead of aborting the whole switch attempt.
         if (this.initializingContexts.size > 0) {
             const initializingList = [...this.initializingContexts].join(", ");
-            this.logger.error(
-                `[ContextPool] Pre-cleanup ERROR: initializingContexts not empty after aborting background task! Contexts still initializing: [${initializingList}]`
-            );
-            throw new Error(
-                `Pre-cleanup failed: initializingContexts not empty (${initializingList}). This should not happen after aborting background task.`
+            this.logger.warn(
+                `[ContextPool] Pre-cleanup: initializingContexts still non-empty [${initializingList}]; proceeding anyway (switch target=#${targetAuthIndex}).`
             );
         }
 
