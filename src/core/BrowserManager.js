@@ -76,6 +76,14 @@ class BrowserManager {
         // Map: authIndex -> { success: boolean, failed: boolean }
         this._wsInitState = new Map();
 
+        // Serializes the browser-level context creation phase (newContext +
+        // addInitScript + newPage). Camoufox/Playwright Firefox appears to
+        // deadlock when these calls race across parallel _initializeContext
+        // invocations — only the last caller progresses. Serializing just this
+        // fast setup phase still lets the slow phases (goto, WS init wait)
+        // run in parallel across contexts.
+        this._contextCreationLock = Promise.resolve();
+
         // Target URL for AI Studio app
         this.targetUrl = "https://ai.studio/apps/c48c6178-8dad-4d16-8de7-bb78d265482c";
 
@@ -1947,23 +1955,45 @@ class BrowserManager {
                 throw new ContextAbortedError(authIndex, "marked for deletion");
             }
 
-            context = await this.browser.newContext({
-                deviceScaleFactor: 1,
-                storageState: storageStateObject,
-                viewport: { height: randomHeight, width: randomWidth },
-                ...(proxyConfig ? { proxy: proxyConfig } : {}),
+            // Serialize the browser-level setup across parallel invocations.
+            // Chain onto the existing lock and replace it with our own promise
+            // so the next caller waits for us. Using a single shared chain
+            // keeps ordering deterministic and avoids the observed deadlock
+            // in Camoufox where concurrent newContext/newPage across multiple
+            // auth indices caused all but the last invocation to hang before
+            // the init script could ever run.
+            const previousLock = this._contextCreationLock;
+            let releaseLock;
+            this._contextCreationLock = new Promise(resolve => {
+                releaseLock = resolve;
             });
+            try {
+                await previousLock;
 
-            // Check abort status after context creation
-            if (this.abortedContexts.has(authIndex) || (isBackgroundTask && this._backgroundPreloadAbort)) {
-                throw new ContextAbortedError(authIndex, "marked for deletion");
+                this.logger.debug(`[Context#${authIndex}] Creating browser context...`);
+                context = await this.browser.newContext({
+                    deviceScaleFactor: 1,
+                    storageState: storageStateObject,
+                    viewport: { height: randomHeight, width: randomWidth },
+                    ...(proxyConfig ? { proxy: proxyConfig } : {}),
+                });
+                this.logger.debug(`[Context#${authIndex}] Context created, injecting privacy script...`);
+
+                // Check abort status after context creation
+                if (this.abortedContexts.has(authIndex) || (isBackgroundTask && this._backgroundPreloadAbort)) {
+                    throw new ContextAbortedError(authIndex, "marked for deletion");
+                }
+
+                // Inject Privacy Script immediately after context creation
+                const privacyScript = this._getPrivacyProtectionScript(authIndex);
+                await context.addInitScript(privacyScript);
+                this.logger.debug(`[Context#${authIndex}] Init script injected, opening page...`);
+
+                page = await context.newPage();
+                this.logger.debug(`[Context#${authIndex}] Page opened, releasing creation lock.`);
+            } finally {
+                releaseLock();
             }
-
-            // Inject Privacy Script immediately after context creation
-            const privacyScript = this._getPrivacyProtectionScript(authIndex);
-            await context.addInitScript(privacyScript);
-
-            page = await context.newPage();
 
             // NOTE: Removed bringToFront/window.focus/humanMovement wakeup step.
             // In headless Camoufox it has no effect, and under parallel batch
