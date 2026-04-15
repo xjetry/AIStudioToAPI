@@ -1736,19 +1736,17 @@ class BrowserManager {
             }
         }
 
-        // Priority 3: Accounts in rotation, from farthest to closest (reverse rotation order)
-        // Multi-context mode intentionally SKIPS this step: healthy non-active rotation
-        // contexts must not be evicted just to make room for a new switch target. The pool
-        // is allowed to temporarily exceed maxContexts in that case; the warning below
-        // surfaces the overcommit so operators can tune MAX_CONTEXTS if it becomes chronic.
-        if (maxContexts === 1) {
-            for (let i = orderedFromTarget.length - 1; i >= 0; i--) {
-                const canonical = orderedFromTarget[i];
-                // Find all contexts with this canonical index
-                for (const idx of allContextIndices) {
-                    if (this.authSource.getCanonicalIndex(idx) === canonical && !removalPriority.includes(idx)) {
-                        removalPriority.push(idx);
-                    }
+        // Priority 3: Accounts in rotation, from farthest to closest (reverse rotation order).
+        // This IS the LRU eviction step that keeps pool size bounded. In-flight traffic is
+        // protected by the graceful-drain path inside closeContext below (it waits for the
+        // account's in-flight requests to finish up to CONTEXT_CLOSE_DRAIN_TIMEOUT_MS before
+        // tearing the context down), so eviction here no longer abruptly kills live work.
+        for (let i = orderedFromTarget.length - 1; i >= 0; i--) {
+            const canonical = orderedFromTarget[i];
+            // Find all contexts with this canonical index
+            for (const idx of allContextIndices) {
+                if (this.authSource.getCanonicalIndex(idx) === canonical && !removalPriority.includes(idx)) {
+                    removalPriority.push(idx);
                 }
             }
         }
@@ -1756,9 +1754,9 @@ class BrowserManager {
         // Remove contexts according to priority until we have enough space
         const toRemove = removalPriority.slice(0, removeCount);
 
-        if (toRemove.length < removeCount && maxContexts !== 1) {
+        if (toRemove.length < removeCount) {
             this.logger.warn(
-                `[ContextPool] Pre-cleanup: only freed ${toRemove.length}/${removeCount} slot(s) for switch to #${targetAuthIndex}; pool will temporarily exceed maxContexts=${maxContexts} to preserve non-active contexts.`
+                `[ContextPool] Pre-cleanup: only freed ${toRemove.length}/${removeCount} slot(s) for switch to #${targetAuthIndex}; pool will temporarily exceed maxContexts=${maxContexts}.`
             );
         }
 
@@ -1811,12 +1809,6 @@ class BrowserManager {
             currentCanonicalIndex !== null &&
             currentCanonicalIndex !== this._currentAuthIndex;
 
-        // Multi-context limited mode: protect healthy non-active in-rotation contexts.
-        // They must stay alive across rebalances. We only clean up genuinely stale entries
-        // (old duplicates, expired, or deleted accounts) — those are not in rotation directly.
-        const isMultiLimitedMode = !isUnlimited && maxContexts !== 1;
-        const rotationSet = new Set(rotation);
-
         for (const idx of this.contexts.keys()) {
             // Skip current account
             if (idx === this._currentAuthIndex) continue;
@@ -1827,15 +1819,9 @@ class BrowserManager {
                 continue;
             }
 
-            // Remove if not in targets
+            // Remove if not in targets. Graceful drain inside closeContext protects
+            // any in-flight traffic on these contexts up to the configured drain budget.
             if (!targets.has(idx)) {
-                // Multi-context limited mode protection: keep in-rotation contexts alive even
-                // if they fall outside the target window. rotationSet contains canonical,
-                // non-expired indices, so old duplicates / expired / deleted accounts still
-                // fall through and get cleaned up.
-                if (isMultiLimitedMode && rotationSet.has(idx)) {
-                    continue;
-                }
                 toRemove.push(idx);
             }
         }
