@@ -84,6 +84,12 @@ class BrowserManager {
         // run in parallel across contexts.
         this._contextCreationLock = Promise.resolve();
 
+        // Idle auto-refill: after ~5s of no WebUI account-related activity,
+        // if the pool has free capacity, preload the next rotation accounts
+        // until we hit maxContexts. Reset/rescheduled on every WebUI touch.
+        this._idleRefillTimer = null;
+        this._idleRefillDelayMs = 5000;
+
         // Target URL for AI Studio app
         this.targetUrl = "https://ai.studio/apps/c48c6178-8dad-4d16-8de7-bb78d265482c";
 
@@ -195,7 +201,7 @@ class BrowserManager {
         this.logger.info(`${logPrefix} ⏳ Waiting for WebSocket initialization (timeout: ${timeout / 1000}s)...`);
 
         const startTime = Date.now();
-        const checkInterval = 1000; // Check every 1 second
+        const checkInterval = 250; // Check the state map every 250ms
 
         try {
             while (Date.now() - startTime < timeout) {
@@ -213,39 +219,25 @@ class BrowserManager {
                     );
                 }
 
-                // Read state fresh each iteration
+                // Read state fresh each iteration. The console listener writes
+                // this Map synchronously on every forwarded browser log, so a
+                // plain Node-side poll is enough — no browser calls needed here.
                 const state = this._wsInitState.get(authIndex);
 
-                // Check if initialization succeeded
                 if (state && state.success) {
                     return true;
                 }
-
-                // Check if initialization failed
                 if (state && state.failed) {
                     this.logger.warn(`${logPrefix} Initialization failed`);
                     return false;
                 }
 
-                // Check for page errors
-                const errors = await this._checkPageErrors(page);
-                if (errors.appletFailed || errors.concurrentUpdates || errors.snapshotFailed) {
-                    this.logger.warn(`${logPrefix} Detected page error: ${JSON.stringify(errors)}`);
-                    return false;
-                }
-                // Random mouse movement while waiting (80% chance per iteration)
-                if (Math.random() < 0.3) {
-                    try {
-                        const vp = page.viewportSize() || { height: 1080, width: 1920 };
-                        const randomX = Math.floor(Math.random() * (vp.width * 0.7));
-                        const randomY = Math.floor(Math.random() * (vp.height * 0.7));
-                        await this._simulateHumanMovement(page, randomX, randomY);
-                    } catch (e) {
-                        // Ignore movement errors
-                    }
-                }
-                // Wait before next check
-                await page.waitForTimeout(checkInterval);
+                // Do NOT call page.evaluate / page.mouse.move from this loop.
+                // Concurrent browser-level calls across parallel contexts hit
+                // a Camoufox/Playwright Firefox serialization bottleneck that
+                // caused individual waiters to hang indefinitely after their
+                // WS connection had already succeeded.
+                await new Promise(resolve => setTimeout(resolve, checkInterval));
             }
 
             // Timeout reached
@@ -291,7 +283,23 @@ class BrowserManager {
                 return;
             }
 
-            const storageState = await contextData.context.storageState();
+            // Serialize storageState() on the same lock we use for newContext:
+            // it is also a browser-level call and racing multiple of them
+            // across parallel contexts hangs under Camoufox/Playwright Firefox.
+            const previousLock = this._contextCreationLock;
+            let releaseLock;
+            this._contextCreationLock = new Promise(resolve => {
+                releaseLock = resolve;
+            });
+            let storageState;
+            try {
+                await previousLock;
+                this.logger.debug(`[Auth Update] Reading storageState for #${authIndex}...`);
+                storageState = await contextData.context.storageState();
+                this.logger.debug(`[Auth Update] storageState for #${authIndex} read.`);
+            } finally {
+                releaseLock();
+            }
 
             // Merge new credentials into existing data
             authData.cookies = storageState.cookies;
@@ -1844,55 +1852,27 @@ class BrowserManager {
             targets = new Set(ordered.slice(0, maxContexts));
         }
 
-        // Remove contexts not in targets (except current)
-        // Special handling: if current account is a duplicate (old version), also remove its canonical version
-        // BUT only in limited mode - in unlimited mode, keep all contexts
-        const toRemove = [];
-        const currentCanonicalIndex = currentCanonical; // Already calculated above
-        const isDuplicateAccount =
-            this._currentAuthIndex >= 0 &&
-            currentCanonicalIndex !== null &&
-            currentCanonicalIndex !== this._currentAuthIndex;
+        // NEW POLICY: Rebalance is additive only. It never evicts existing
+        // contexts — the user has explicit control over closure via the
+        // WebUI "Close session" button. This removes the historical
+        // surprise where switching accounts would silently drop unrelated
+        // loaded contexts. Duplicate-account cleanup also happens only
+        // when the user explicitly asks.
 
-        for (const idx of this.contexts.keys()) {
-            // Skip current account
-            if (idx === this._currentAuthIndex) continue;
-
-            // If current is a duplicate AND we're in limited mode, remove the canonical version (we're using the old one)
-            if (!isUnlimited && isDuplicateAccount && idx === currentCanonicalIndex) {
-                toRemove.push(idx);
-                continue;
-            }
-
-            // Remove if not in targets. Graceful drain inside closeContext protects
-            // any in-flight traffic on these contexts up to the configured drain budget.
-            if (!targets.has(idx)) {
-                toRemove.push(idx);
-            }
-        }
-
-        // Candidates: all accounts from ordered that are not yet initialized
-        // Pass the full ordered list to allow fallback if target accounts fail
-        // The background task will stop when poolSize is reached
-        // Convert activeContexts to canonical indices to handle duplicate accounts
-        const activeContextsRaw = new Set([...this.contexts.keys()].filter(idx => !toRemove.includes(idx)));
-        const activeContexts = new Set(
-            [...activeContextsRaw].map(idx => this.authSource.getCanonicalIndex(idx) ?? idx)
+        // Candidates: accounts in rotation order that are not yet present.
+        // Convert active contexts to canonical indices so duplicates collapse.
+        const activeCanonical = new Set(
+            [...this.contexts.keys(), ...this.initializingContexts].map(
+                idx => this.authSource.getCanonicalIndex(idx) ?? idx
+            )
         );
-        // Don't filter out initializingContexts here - let _executePreloadTask handle it
-        // This ensures that if a background task is aborted, the account will be retried
-        // If a foreground task is running, _executePreloadTask will skip it (line 1382)
-        const candidates = ordered.filter(idx => !activeContexts.has(idx));
+        const candidates = ordered.filter(idx => !activeCanonical.has(idx));
 
         this.logger.info(
-            `[ContextPool] Rebalance: targets=[${[...targets]}], remove=[${toRemove}], candidates=[${candidates}]`
+            `[ContextPool] Rebalance (additive only): targets=[${[...targets]}], currentPool=[${[...this.contexts.keys()]}], candidates=[${candidates}]`
         );
 
-        for (const idx of toRemove) {
-            await this.closeContext(idx, { graceful: true });
-        }
-
-        // Preload candidates if we have room in the pool
+        // Preload candidates only if we still have room.
         if (candidates.length > 0 && (isUnlimited || this.contexts.size < maxContexts)) {
             this._preloadBackgroundContexts(candidates, isUnlimited ? 0 : maxContexts);
         }
@@ -2695,6 +2675,158 @@ class BrowserManager {
         this.logger.info(`🔄 [Browser] Starting account switch: from ${this._currentAuthIndex} to ${newAuthIndex}`);
         await this.launchOrSwitchContext(newAuthIndex);
         this.logger.info(`✅ [Browser] Account switch completed, current account: ${this._currentAuthIndex}`);
+    }
+
+    /**
+     * Report whether the pool can accept a switch to `authIndex` without
+     * evicting any existing context. Used by the capacity-aware switch flow:
+     * if this returns { ok: false }, the UI should prompt the user to close
+     * a session first instead of silently dropping one.
+     * @param {number} authIndex
+     * @returns {{ok:true}|{ok:false, reason:'pool_full', openContexts:number[]}}
+     */
+    canAccommodate(authIndex) {
+        const maxContexts = this.config.maxContexts;
+        if (!maxContexts || maxContexts === 0) return { ok: true };
+        if (this.contexts.has(authIndex)) return { ok: true };
+        if (this.initializingContexts.has(authIndex)) return { ok: true };
+        const used = this.contexts.size + this.initializingContexts.size;
+        if (used < maxContexts) return { ok: true };
+        return {
+            ok: false,
+            openContexts: [...this.contexts.keys()],
+            reason: "pool_full",
+        };
+    }
+
+    /**
+     * Close a single context without touching the rest of the pool. Used by
+     * the WebUI "Close session" button. When called for the currently-active
+     * account, transparently FastSwitches to another already-loaded context
+     * first; if none exist the active pointer is reset to -1 and subsequent
+     * requests will fail until the user switches manually.
+     *
+     * @param {number} authIndex
+     * @returns {Promise<{closed:boolean, switchedTo:number|null}>}
+     */
+    async closeSpecificContext(authIndex) {
+        if (!this.contexts.has(authIndex) && !this.initializingContexts.has(authIndex)) {
+            return { closed: false, reason: "not_present", switchedTo: null };
+        }
+
+        let switchedTo = null;
+        if (this._currentAuthIndex === authIndex) {
+            // Pick any other ready context to FastSwitch into. Skip entries
+            // whose page is already closed (stale map entries).
+            for (const [idx, data] of this.contexts.entries()) {
+                if (idx === authIndex) continue;
+                if (!data || !data.page || data.page.isClosed?.()) continue;
+                switchedTo = idx;
+                break;
+            }
+
+            if (switchedTo !== null) {
+                this.logger.info(
+                    `[Browser] Closing active context #${authIndex}; FastSwitching to already-loaded account #${switchedTo} first.`
+                );
+                try {
+                    await this.launchOrSwitchContext(switchedTo);
+                } catch (e) {
+                    this.logger.warn(
+                        `[Browser] FastSwitch to #${switchedTo} while closing #${authIndex} failed: ${e.message}. Proceeding with close anyway.`
+                    );
+                    switchedTo = null;
+                }
+            } else {
+                this.logger.warn(
+                    `[Browser] Closing active context #${authIndex} but no other loaded context is available; currentAuthIndex will be reset to -1.`
+                );
+            }
+        }
+
+        // Notify the matching message queue so in-flight requests get a clean
+        // error instead of hanging, then tear down the Playwright context.
+        if (this.connectionRegistry) {
+            try {
+                this.connectionRegistry.closeConnectionByAuth(authIndex);
+            } catch (e) {
+                this.logger.debug(`[Browser] closeConnectionByAuth(${authIndex}) during manual close: ${e.message}`);
+            }
+        }
+        await this.closeContext(authIndex, { graceful: true });
+
+        if (this._currentAuthIndex === authIndex) {
+            this._currentAuthIndex = -1;
+        }
+
+        return { closed: true, switchedTo };
+    }
+
+    /**
+     * Called by WebUI account-related route handlers to reset the idle auto-
+     * refill timer. When the user stops touching account state for 5 seconds,
+     * we fill any free pool slots with the next rotation candidates.
+     */
+    notifyWebUIActivity() {
+        this._scheduleIdleRefill();
+    }
+
+    _scheduleIdleRefill() {
+        if (this._idleRefillTimer) {
+            clearTimeout(this._idleRefillTimer);
+            this._idleRefillTimer = null;
+        }
+        const maxContexts = this.config.maxContexts;
+        if (!maxContexts || maxContexts === 0) return;
+        this._idleRefillTimer = setTimeout(() => {
+            this._idleRefillTimer = null;
+            this._runIdleRefill().catch(err => {
+                this.logger.warn(`[ContextPool] Idle refill failed: ${err.message}`);
+            });
+        }, this._idleRefillDelayMs);
+        if (this._idleRefillTimer.unref) this._idleRefillTimer.unref();
+    }
+
+    async _runIdleRefill() {
+        const maxContexts = this.config.maxContexts;
+        if (!maxContexts || maxContexts === 0) return;
+
+        const used = this.contexts.size + this.initializingContexts.size;
+        if (used >= maxContexts) {
+            this.logger.debug(`[ContextPool] Idle refill skipped: pool already at ${used}/${maxContexts}.`);
+            return;
+        }
+
+        if (this._backgroundPreloadTask) {
+            this.logger.debug("[ContextPool] Idle refill skipped: background preload already running.");
+            return;
+        }
+
+        const rotation = this.authSource.getRotationIndices();
+        if (!rotation || rotation.length === 0) return;
+
+        const currentCanonical =
+            this._currentAuthIndex >= 0 ? this.authSource.getCanonicalIndex(this._currentAuthIndex) : null;
+        const startPos = currentCanonical !== null ? Math.max(rotation.indexOf(currentCanonical), 0) : 0;
+
+        // Build an ordered candidate list starting AFTER the current account,
+        // wrapping around, skipping anything already present/initializing.
+        const activeCanonical = new Set(
+            [...this.contexts.keys(), ...this.initializingContexts].map(
+                idx => this.authSource.getCanonicalIndex(idx) ?? idx
+            )
+        );
+        const candidates = [];
+        for (let i = 1; i <= rotation.length; i++) {
+            const idx = rotation[(startPos + i) % rotation.length];
+            if (!activeCanonical.has(idx)) candidates.push(idx);
+        }
+        if (candidates.length === 0) return;
+
+        this.logger.info(
+            `[ContextPool] Idle refill: pool at ${used}/${maxContexts}, preloading next candidates [${candidates.slice(0, maxContexts - used).join(", ")}]...`
+        );
+        this._preloadBackgroundContexts(candidates, maxContexts);
     }
 }
 

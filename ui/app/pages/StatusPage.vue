@@ -852,6 +852,32 @@
                                         </svg>
                                     </button>
                                     <button
+                                        v-if="item.hasContext"
+                                        class="btn-close-ctx"
+                                        :disabled="isBusy"
+                                        :title="
+                                            item.index === state.currentAuthIndex
+                                                ? t('btnCloseContextActive')
+                                                : t('btnCloseContext')
+                                        "
+                                        @click.stop="closeContextByIndex(item.index)"
+                                    >
+                                        <svg
+                                            xmlns="http://www.w3.org/2000/svg"
+                                            width="16"
+                                            height="16"
+                                            viewBox="0 0 24 24"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            stroke-width="2"
+                                            stroke-linecap="round"
+                                            stroke-linejoin="round"
+                                        >
+                                            <path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path>
+                                            <line x1="12" y1="2" x2="12" y2="12"></line>
+                                        </svg>
+                                    </button>
+                                    <button
                                         class="btn-danger"
                                         :disabled="isBusy"
                                         :title="t('btnDeleteUser')"
@@ -4075,6 +4101,129 @@ const handleStreamingModeBeforeChange = async () => {
 };
 
 // Switch account by index
+// Perform the actual PUT /api/accounts/current call. Returns true on success.
+// Handles the new 409 pool_full response by opening a selector dialog so the
+// user can pick one existing session to close, then retries the switch.
+const performAccountSwitch = async targetIndex => {
+    const notification = ElNotification({
+        duration: 0,
+        message: t("switchingAccountNotice"),
+        title: t("warningTitle"),
+        type: "warning",
+    });
+    state.isSwitchingAccount = true;
+    let retried = false;
+    try {
+        const res = await fetch("/api/accounts/current", {
+            body: JSON.stringify({ targetIndex }),
+            headers: { "Content-Type": "application/json" },
+            method: "PUT",
+        });
+        const data = await res.json();
+
+        if (res.ok) {
+            ElMessage.success(t(data.message, data));
+            return true;
+        }
+
+        if (res.status === 409 && data.reason === "pool_full") {
+            notification.close();
+            state.isSwitchingAccount = false;
+            retried = true;
+            const closed = await promptCloseSessionForSwitch(targetIndex, data.openContexts || []);
+            if (closed === null) return false; // user cancelled
+            // Close succeeded; retry the switch immediately.
+            return await performAccountSwitch(targetIndex);
+        }
+
+        ElMessage.error(t(data.message, data));
+        return false;
+    } catch (err) {
+        ElMessage.error(t("settingFailed", { message: err.message || err }));
+        return false;
+    } finally {
+        if (!retried) {
+            state.isSwitchingAccount = false;
+            notification.close();
+        }
+        updateContent();
+    }
+};
+
+// Show a dialog that lists the currently-loaded context indices. The user
+// clicks one entry to close it; on success, the caller retries the switch.
+// Returns `true` when a session was closed, `null` when the user cancels.
+const promptCloseSessionForSwitch = async (targetIndex, openContexts) => {
+    const contextItems = (openContexts || [])
+        .map(idx => {
+            const acc = state.accountDetails.find(a => a.index === idx);
+            return {
+                index: idx,
+                isCurrent: idx === state.currentAuthIndex,
+                name: acc ? getAccountDisplayName(acc) : `#${idx}`,
+            };
+        })
+        .sort((a, b) => a.index - b.index);
+
+    return new Promise(resolve => {
+        const hNode = h(
+            "div",
+            { style: "display: flex; flex-direction: column; gap: 8px; max-height: 320px; overflow-y: auto;" },
+            [
+                h(
+                    "div",
+                    { style: "margin-bottom: 4px; font-size: 13px; color: var(--el-text-color-regular);" },
+                    t("poolFullHint", { target: `#${targetIndex}` })
+                ),
+                ...contextItems.map(item =>
+                    h(
+                        "button",
+                        {
+                            class: "pool-full-entry",
+                            onClick: async () => {
+                                ElMessageBox.close();
+                                const ok = await closeContextByIndex(item.index, { silent: true });
+                                resolve(ok ? true : null);
+                            },
+                            style: [
+                                "display: flex; justify-content: space-between; align-items: center;",
+                                "gap: 12px; padding: 10px 12px; border-radius: 6px;",
+                                "border: 1px solid var(--el-border-color); background: var(--el-fill-color-light);",
+                                "cursor: pointer; text-align: left; font-size: 14px;",
+                            ].join(" "),
+                        },
+                        [
+                            h("span", null, `#${item.index} — ${item.name}`),
+                            item.isCurrent
+                                ? h(
+                                      "span",
+                                      {
+                                          style: "font-size: 12px; color: var(--el-color-warning); font-weight: 600;",
+                                      },
+                                      t("tagCurrent")
+                                  )
+                                : null,
+                        ]
+                    )
+                ),
+            ]
+        );
+
+        ElMessageBox({
+            callback: action => {
+                if (action === "cancel" || action === "close") resolve(null);
+            },
+            cancelButtonText: t("cancel"),
+            closeOnClickModal: false,
+            lockScroll: false,
+            message: hNode,
+            showCancelButton: true,
+            showConfirmButton: false,
+            title: t("poolFullTitle"),
+        });
+    });
+};
+
 const switchAccountByIndex = targetIndex => {
     if (state.currentAuthIndex === targetIndex) {
         ElMessage.warning(t("alreadyCurrentAccount"));
@@ -4090,40 +4239,53 @@ const switchAccountByIndex = targetIndex => {
         lockScroll: false,
         type: "warning",
     })
-        .then(async () => {
-            const notification = ElNotification({
-                duration: 0,
-                message: t("switchingAccountNotice"),
-                title: t("warningTitle"),
-                type: "warning",
-            });
-            state.isSwitchingAccount = true;
-            try {
-                const res = await fetch("/api/accounts/current", {
-                    body: JSON.stringify({ targetIndex }),
-                    headers: { "Content-Type": "application/json" },
-                    method: "PUT",
-                });
-                const data = await res.json();
-                const message = t(data.message, data);
-                if (res.ok) {
-                    ElMessage.success(message);
-                } else {
-                    ElMessage.error(message);
-                }
-            } catch (err) {
-                ElMessage.error(t("settingFailed", { message: err.message || err }));
-            } finally {
-                state.isSwitchingAccount = false;
-                notification.close();
-                updateContent();
-            }
-        })
+        .then(() => performAccountSwitch(targetIndex))
         .catch(e => {
             if (e !== "cancel") {
                 console.error(e);
             }
         });
+};
+
+// Close the browser context for a specific account. When `silent` is true we
+// skip the confirmation dialog (used by the pool-full selector flow which
+// already confirmed intent).
+const closeContextByIndex = async (targetIndex, { silent = false } = {}) => {
+    const targetAccount = state.accountDetails.find(acc => acc.index === targetIndex);
+    const accountSuffix = targetAccount ? ` (${getAccountDisplayName(targetAccount)})` : "";
+    const isCurrent = targetIndex === state.currentAuthIndex;
+
+    if (!silent) {
+        const message = isCurrent
+            ? t("confirmCloseContextActive", { index: targetIndex, suffix: accountSuffix })
+            : `${t("confirmCloseContext")} #${targetIndex}${accountSuffix}?`;
+        try {
+            await ElMessageBox.confirm(message, t("warningTitle"), {
+                cancelButtonText: t("cancel"),
+                confirmButtonText: t("ok"),
+                lockScroll: false,
+                type: isCurrent ? "warning" : "info",
+            });
+        } catch (e) {
+            if (e !== "cancel") console.error(e);
+            return false;
+        }
+    }
+
+    try {
+        const res = await fetch(`/api/accounts/${targetIndex}/context`, { method: "DELETE" });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+            ElMessage.success(t(data.message || "closeContextSuccess", data));
+            updateContent();
+            return true;
+        }
+        ElMessage.error(t(data.message || "closeContextFailed", data));
+        return false;
+    } catch (err) {
+        ElMessage.error(t("settingFailed", { message: err.message || err }));
+        return false;
+    }
 };
 
 const copyText = async text => {
@@ -4927,11 +5089,22 @@ watchEffect(() => {
             color: @error-color;
         }
 
+        &.btn-close-ctx:hover:not(:disabled) {
+            border-color: @warning-color;
+            color: @warning-color;
+        }
+
         &.btn-warning:hover:not(:disabled) {
             border-color: @warning-color;
             color: @warning-color;
         }
     }
+}
+
+/* Pool-full selector entries */
+.pool-full-entry:hover {
+    background: var(--el-color-primary-light-9) !important;
+    border-color: var(--el-color-primary) !important;
 }
 
 /* Account list styles */

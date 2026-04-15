@@ -290,12 +290,28 @@ class AuthSwitcher {
             };
         }
 
+        // Capacity check: if the target is not yet loaded and the pool has
+        // no free slot, bail out early and let the caller prompt the user to
+        // close an existing session. We explicitly no longer auto-evict.
+        const capacity = this.browserManager.canAccommodate(targetIndex);
+        if (!capacity.ok) {
+            this.logger.info(
+                `🔒 [Auth] Switch to #${targetIndex} deferred: pool full with [${capacity.openContexts.join(", ")}]. User must close a session first.`
+            );
+            return {
+                openContexts: capacity.openContexts,
+                reason: "pool_full",
+                success: false,
+            };
+        }
+
         this.isSystemBusy = true;
         try {
             return await this._raceAgainstSwitchDeadline(async () => {
                 this.logger.info(`🔄 [Auth] Starting switch to specified account #${targetIndex}...`);
-                // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
-                await this.browserManager.preCleanupForSwitch(targetIndex);
+                // NOTE: preCleanupForSwitch is intentionally NOT called here.
+                // Capacity was validated above; switching will either FastSwitch
+                // into an already-loaded context or init a new one in a free slot.
                 await this.browserManager.switchAccount(targetIndex);
                 this.resetCounters();
                 this.browserManager.rebalanceContextPool().catch(err => {

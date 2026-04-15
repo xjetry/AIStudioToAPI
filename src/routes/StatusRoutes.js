@@ -177,6 +177,7 @@ class StatusRoutes {
         app.put("/api/accounts/current", isAuthenticated, async (req, res) => {
             try {
                 if (this._rejectIfSystemBusy(res)) return;
+                this.serverSystem.browserManager.notifyWebUIActivity?.();
 
                 const { targetIndex } = req.body;
                 if (targetIndex !== undefined && targetIndex !== null) {
@@ -184,6 +185,13 @@ class StatusRoutes {
                     const result = await this.serverSystem.requestHandler._switchToSpecificAuth(targetIndex);
                     if (result.success) {
                         res.status(200).json({ message: "accountSwitchSuccess", newIndex: result.newIndex });
+                    } else if (result.reason === "pool_full") {
+                        res.status(409).json({
+                            message: "accountSwitchPoolFull",
+                            openContexts: result.openContexts,
+                            reason: result.reason,
+                            targetIndex,
+                        });
                     } else {
                         res.status(400).json({ message: "accountSwitchFailed", reason: result.reason });
                     }
@@ -206,9 +214,32 @@ class StatusRoutes {
             }
         });
 
+        app.delete("/api/accounts/:index/context", isAuthenticated, async (req, res) => {
+            try {
+                const authIndex = Number(req.params.index);
+                if (!Number.isFinite(authIndex) || authIndex < 0) {
+                    return res.status(400).json({ message: "closeContextInvalid" });
+                }
+                this.serverSystem.browserManager.notifyWebUIActivity?.();
+                this.logger.info(`[WebUI] Received request to close context for account #${authIndex}...`);
+                const result = await this.serverSystem.browserManager.closeSpecificContext(authIndex);
+                if (!result.closed) {
+                    return res.status(404).json({ message: "closeContextNotPresent", reason: result.reason });
+                }
+                res.status(200).json({
+                    closedIndex: authIndex,
+                    message: "closeContextSuccess",
+                    switchedTo: result.switchedTo,
+                });
+            } catch (error) {
+                res.status(500).json({ error: error.message, message: "closeContextFatal" });
+            }
+        });
+
         app.post("/api/accounts/deduplicate", isAuthenticated, async (req, res) => {
             try {
                 if (this._rejectIfSystemBusy(res)) return;
+                this.serverSystem.browserManager.notifyWebUIActivity?.();
 
                 const { authSource, requestHandler } = this.serverSystem;
 
@@ -319,6 +350,7 @@ class StatusRoutes {
         // Batch delete accounts - Must be defined before /api/accounts/:index to avoid index matching "batch"
         app.delete("/api/accounts/batch", isAuthenticated, async (req, res) => {
             if (this._rejectIfSystemBusy(res)) return;
+            this.serverSystem.browserManager.notifyWebUIActivity?.();
 
             const { indices, force } = req.body;
             const currentAuthIndex = this.serverSystem.requestHandler.currentAuthIndex;
@@ -542,6 +574,7 @@ class StatusRoutes {
 
         app.delete("/api/accounts/:index", isAuthenticated, async (req, res) => {
             if (this._rejectIfSystemBusy(res)) return;
+            this.serverSystem.browserManager.notifyWebUIActivity?.();
 
             const rawIndex = req.params.index;
             const targetIndex = Number(rawIndex);
