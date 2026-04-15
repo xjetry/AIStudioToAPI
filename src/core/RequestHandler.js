@@ -35,7 +35,6 @@ class RequestHandler {
 
         this.maxRetries = this.config.maxRetries;
         this.retryDelay = this.config.retryDelay;
-        this.needsSwitchingAfterRequest = false;
 
         // Timeout settings
         this.timeouts = TIMEOUTS;
@@ -172,6 +171,29 @@ class RequestHandler {
     // Delegate methods to AuthSwitcher
     async _switchToNextAuth() {
         return this.authSwitcher.switchToNextAuth();
+    }
+
+    /**
+     * Fire a background account switch the moment the usage counter crosses
+     * `switchOnUses`. The switch runs fire-and-forget: the triggering request
+     * keeps executing on the current account (which is exactly `switchOnUses`
+     * slots full by the time this fires), while subsequent requests block on
+     * the isSystemBusy guard in `_waitForSystemAndConnectionIfBusy` and land
+     * on the new account once the switch resolves.
+     *
+     * Guarded by `isSystemBusy` to avoid redundant fires when a switch is
+     * already in progress; `switchToNextAuth()` itself also short-circuits in
+     * that case, but checking here keeps the log clean.
+     */
+    _maybeFireBackgroundSwitchForUsage() {
+        if (!this.authSwitcher.shouldSwitchByUsage()) return;
+        if (this.authSwitcher.isSystemBusy) return;
+        this.logger.info(
+            `[Auth] Rotation count reached switching threshold (${this.authSwitcher.usageCount}/${this.config.switchOnUses}), firing background account switch...`
+        );
+        this.authSwitcher.switchToNextAuth().catch(err => {
+            this.logger.error(`[Auth] Background account switching task failed: ${err.message}`);
+        });
     }
 
     async _switchToSpecificAuth(targetIndex) {
@@ -486,10 +508,12 @@ class RequestHandler {
 
     /**
      * Wait for system to become ready (not busy with switching/recovery)
-     * @param {number} timeoutMs - Maximum time to wait in milliseconds (default 120s, same as browser launch timeout)
+     * @param {number} [timeoutMs] - Maximum time to wait in milliseconds.
+     *     Defaults to `config.systemBusyWaitTimeoutMs` (env: `SYSTEM_BUSY_WAIT_TIMEOUT_MS`,
+     *     default 120000ms).
      * @returns {Promise<boolean>} true if system becomes ready, false if timeout
      */
-    async _waitForSystemReady(timeoutMs = 120000) {
+    async _waitForSystemReady(timeoutMs = this.config.systemBusyWaitTimeoutMs) {
         if (!this.authSwitcher.isSystemBusy) {
             return true;
         }
@@ -788,9 +812,7 @@ class RequestHandler {
                     this.logger.info(
                         `[Request] Generation request - account rotation count: ${rotationCountText} (Current account: ${this.currentAuthIndex})`
                     );
-                    if (this.authSwitcher.shouldSwitchByUsage()) {
-                        this.needsSwitchingAfterRequest = true;
-                    }
+                    this._maybeFireBackgroundSwitchForUsage();
                 }
             }
 
@@ -841,15 +863,6 @@ class RequestHandler {
                 this._handleRequestError(error, res, "gemini");
             } finally {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
-                if (this.needsSwitchingAfterRequest) {
-                    this.logger.info(
-                        `[Auth] Rotation count reached switching threshold (${this.authSwitcher.usageCount}/${this.config.switchOnUses}), will automatically switch account in background...`
-                    );
-                    this.authSwitcher.switchToNextAuth().catch(err => {
-                        this.logger.error(`[Auth] Background account switching task failed: ${err.message}`);
-                    });
-                    this.needsSwitchingAfterRequest = false;
-                }
                 if (!res.writableEnded) res.end();
             }
         } finally {
@@ -979,9 +992,7 @@ class RequestHandler {
                 this.logger.info(
                     `[Request] OpenAI generation request - account rotation count: ${rotationCountText} (Current account: ${this.currentAuthIndex})`
                 );
-                if (this.authSwitcher.shouldSwitchByUsage()) {
-                    this.needsSwitchingAfterRequest = true;
-                }
+                this._maybeFireBackgroundSwitchForUsage();
             }
 
             // Translate OpenAI format to Google format (also handles model name suffix parsing)
@@ -1271,15 +1282,6 @@ class RequestHandler {
                 this._handleRequestError(error, res);
             } finally {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
-                if (this.needsSwitchingAfterRequest) {
-                    this.logger.info(
-                        `[Auth] Rotation count reached switching threshold (${this.authSwitcher.usageCount}/${this.config.switchOnUses}), will automatically switch account in background...`
-                    );
-                    this.authSwitcher.switchToNextAuth().catch(err => {
-                        this.logger.error(`[Auth] Background account switching task failed: ${err.message}`);
-                    });
-                    this.needsSwitchingAfterRequest = false;
-                }
                 if (!res.writableEnded) res.end();
             }
         } finally {
@@ -1384,9 +1386,7 @@ class RequestHandler {
                 this.logger.info(
                     `[Request] OpenAI Response generation request - account rotation count: ${rotationCountText} (Current account: ${this.currentAuthIndex})`
                 );
-                if (this.authSwitcher.shouldSwitchByUsage()) {
-                    this.needsSwitchingAfterRequest = true;
-                }
+                this._maybeFireBackgroundSwitchForUsage();
             }
 
             // Translate OpenAI Response format to Google format
@@ -1694,15 +1694,6 @@ class RequestHandler {
                 this._handleRequestError(error, res, "response_api");
             } finally {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
-                if (this.needsSwitchingAfterRequest) {
-                    this.logger.info(
-                        `[Auth] Rotation count reached switching threshold (${this.authSwitcher.usageCount}/${this.config.switchOnUses}), will automatically switch account in background...`
-                    );
-                    this.authSwitcher.switchToNextAuth().catch(err => {
-                        this.logger.error(`[Auth] Background account switching task failed: ${err.message}`);
-                    });
-                    this.needsSwitchingAfterRequest = false;
-                }
                 if (!res.writableEnded) res.end();
             }
         } finally {
@@ -1762,9 +1753,7 @@ class RequestHandler {
                 this.logger.info(
                     `[Request] Claude generation request - account rotation count: ${rotationCountText} (Current account: ${this.currentAuthIndex})`
                 );
-                if (this.authSwitcher.shouldSwitchByUsage()) {
-                    this.needsSwitchingAfterRequest = true;
-                }
+                this._maybeFireBackgroundSwitchForUsage();
             }
 
             // Translate Claude format to Google format
@@ -2054,15 +2043,6 @@ class RequestHandler {
                 this._handleClaudeRequestError(error, res);
             } finally {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
-                if (this.needsSwitchingAfterRequest) {
-                    this.logger.info(
-                        `[Auth] Rotation count reached switching threshold (${this.authSwitcher.usageCount}/${this.config.switchOnUses}), will automatically switch account in background...`
-                    );
-                    this.authSwitcher.switchToNextAuth().catch(err => {
-                        this.logger.error(`[Auth] Background account switching task failed: ${err.message}`);
-                    });
-                    this.needsSwitchingAfterRequest = false;
-                }
                 if (!res.writableEnded) res.end();
             }
         } finally {

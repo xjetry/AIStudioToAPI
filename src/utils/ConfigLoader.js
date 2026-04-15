@@ -38,6 +38,7 @@ class ConfigLoader {
             retryDelay: 2000,
             streamingMode: "real",
             switchOnUses: 40,
+            systemBusyWaitTimeoutMs: 120000,
             wsPort: 9998,
         };
 
@@ -81,6 +82,12 @@ class ConfigLoader {
             config.contextCloseDrainTimeoutMs = Number.isFinite(parsed)
                 ? Math.max(0, parsed)
                 : config.contextCloseDrainTimeoutMs;
+        }
+        if (process.env.SYSTEM_BUSY_WAIT_TIMEOUT_MS) {
+            const parsed = parseInt(process.env.SYSTEM_BUSY_WAIT_TIMEOUT_MS, 10);
+            config.systemBusyWaitTimeoutMs = Number.isFinite(parsed)
+                ? Math.max(1000, parsed)
+                : config.systemBusyWaitTimeoutMs;
         }
         if (process.env.CAMOUFOX_EXECUTABLE_PATH) config.browserExecutablePath = process.env.CAMOUFOX_EXECUTABLE_PATH;
         if (process.env.API_KEYS) {
@@ -176,6 +183,7 @@ class ConfigLoader {
         this.logger.info(
             `  Context Close Drain Timeout: ${config.contextCloseDrainTimeoutMs > 0 ? `${config.contextCloseDrainTimeoutMs}ms` : "Disabled (force close)"}`
         );
+        this.logger.info(`  System Busy Wait Timeout: ${config.systemBusyWaitTimeoutMs}ms`);
         this.logger.info(
             `  Usage-based Switch Threshold: ${
                 config.switchOnUses > 0 ? `Switch after every ${config.switchOnUses} requests` : "Disabled"
