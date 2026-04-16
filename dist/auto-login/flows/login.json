@@ -1,0 +1,253 @@
+{
+  "main": [
+    {
+      "type": "nav",
+      "url": "https://aistudio.google.com/welcome",
+      "t": 1776156857566
+    },
+    {
+      "type": "ready",
+      "url": "https://aistudio.google.com/welcome",
+      "t": 1776156857573
+    },
+    {
+      "type": "nav",
+      "url": "https://aistudio.google.com/welcome",
+      "t": 1776156861534
+    },
+    {
+      "type": "click",
+      "selector": "app-root > ms-marketing-welcome-screen > ms-marketing-welcome-screen-header > header > div > a:nth-of-type(4)",
+      "tag": "A",
+      "text": "login\nGet started",
+      "url": "https://aistudio.google.com/welcome",
+      "t": 1776156868332
+    },
+    {
+      "type": "nav",
+      "url": "https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Faistudio.google.com%2F&dsh=S-918882163%3A1776156869042251&flowName=GlifWebSignIn&flowEntry=ServiceLogin&ifkv=AT1y2_Xu2r3vBb8gR8c-HGzW2wSfMVmXzLxANkiyyjCgTHhA4JC8nFJxUSXbVBuAnKj1rDBwKal5",
+      "t": 1776156869512
+    },
+    {
+      "type": "ready",
+      "url": "https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Faistudio.google.com%2F&dsh=S-918882163%3A1776156869042251&flowName=GlifWebSignIn&flowEntry=ServiceLogin&ifkv=AT1y2_Xu2r3vBb8gR8c-HGzW2wSfMVmXzLxANkiyyjCgTHhA4JC8nFJxUSXbVBuAnKj1rDBwKal5",
+      "t": 1776156869528
+    },
+    {
+      "type": "click",
+      "selector": "#identifierId",
+      "tag": "INPUT",
+      "text": "",
+      "url": "https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Faistudio.google.com%2F&dsh=S-918882163%3A1776156869042251&flowName=GlifWebSignIn&flowEntry=ServiceLogin&ifkv=AT1y2_Xu2r3vBb8gR8c-HGzW2wSfMVmXzLxANkiyyjCgTHhA4JC8nFJxUSXbVBuAnKj1rDBwKal5",
+      "t": 1776156871982
+    },
+    {
+      "type": "nav",
+      "url": "https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Faistudio.google.com%2F&dsh=S-918882163%3A1776156869042251&flowName=GlifWebSignIn&flowEntry=ServiceLogin&ifkv=AT1y2_Xu2r3vBb8gR8c-HGzW2wSfMVmXzLxANkiyyjCgTHhA4JC8nFJxUSXbVBuAnKj1rDBwKal5",
+      "t": 1776156872217
+    },
+    {
+      "type": "fill",
+      "selector": "#identifierId",
+      "value": "__EMAIL__",
+      "url": "https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Faistudio.google.com%2F&dsh=S-918882163%3A1776156869042251&flowName=GlifWebSignIn&flowEntry=ServiceLogin&ifkv=AT1y2_Xu2r3vBb8gR8c-HGzW2wSfMVmXzLxANkiyyjCgTHhA4JC8nFJxUSXbVBuAnKj1rDBwKal5",
+      "t": 1776156875345
+    },
+    {
+      "type": "click",
+      "selector": "div > div:nth-of-type(1) > div > div > button > div:nth-of-type(3)",
+      "tag": "DIV",
+      "text": "下一步",
+      "url": "https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Faistudio.google.com%2F&dsh=S-918882163%3A1776156869042251&flowName=GlifWebSignIn&flowEntry=ServiceLogin&ifkv=AT1y2_Xu2r3vBb8gR8c-HGzW2wSfMVmXzLxANkiyyjCgTHhA4JC8nFJxUSXbVBuAnKj1rDBwKal5",
+      "t": 1776156875346
+    },
+    {
+      "type": "nav",
+      "url": "https://accounts.google.com/v3/signin/challenge/pwd?TL=AIgtPP0Z50S4nxEw2YGA22hgl-Gej-NfjuIIddJiVEDyzUpLZqNGcHO6htzyUN7A&checkConnection=youtube%3A371&checkedDomains=youtube&cid=1&continue=https%3A%2F%2Faistudio.google.com%2F&dsh=S-918882163%3A1776156869042251&flowEntry=ServiceLogin&flowName=GlifWebSignIn&ifkv=AT1y2_Xu2r3vBb8gR8c-HGzW2wSfMVmXzLxANkiyyjCgTHhA4JC8nFJxUSXbVBuAnKj1rDBwKal5&pstMsg=1",
+      "t": 1776156876115
+    },
+    {
+      "type": "click",
+      "selector": "input[name=\"Passwd\"]",
+      "tag": "INPUT",
+      "text": "",
+      "url": "https://accounts.google.com/v3/signin/challenge/pwd?TL=AIgtPP0Z50S4nxEw2YGA22hgl-Gej-NfjuIIddJiVEDyzUpLZqNGcHO6htzyUN7A&checkConnection=youtube%3A371&checkedDomains=youtube&cid=1&continue=https%3A%2F%2Faistudio.google.com%2F&dsh=S-918882163%3A1776156869042251&flowEntry=ServiceLogin&flowName=GlifWebSignIn&ifkv=AT1y2_Xu2r3vBb8gR8c-HGzW2wSfMVmXzLxANkiyyjCgTHhA4JC8nFJxUSXbVBuAnKj1rDBwKal5&pstMsg=1",
+      "t": 1776156882989
+    },
+    {
+      "type": "click",
+      "selector": "input[name=\"Passwd\"]",
+      "tag": "INPUT",
+      "text": "",
+      "url": "https://accounts.google.com/v3/signin/challenge/pwd?TL=AIgtPP0Z50S4nxEw2YGA22hgl-Gej-NfjuIIddJiVEDyzUpLZqNGcHO6htzyUN7A&checkConnection=youtube%3A371&checkedDomains=youtube&cid=1&continue=https%3A%2F%2Faistudio.google.com%2F&dsh=S-918882163%3A1776156869042251&flowEntry=ServiceLogin&flowName=GlifWebSignIn&ifkv=AT1y2_Xu2r3vBb8gR8c-HGzW2wSfMVmXzLxANkiyyjCgTHhA4JC8nFJxUSXbVBuAnKj1rDBwKal5&pstMsg=1",
+      "t": 1776156883327
+    },
+    {
+      "type": "fill",
+      "selector": "input[name=\"Passwd\"]",
+      "value": "__PASSWORD__",
+      "url": "https://accounts.google.com/v3/signin/challenge/pwd?TL=AIgtPP0Z50S4nxEw2YGA22hgl-Gej-NfjuIIddJiVEDyzUpLZqNGcHO6htzyUN7A&checkConnection=youtube%3A371&checkedDomains=youtube&cid=1&continue=https%3A%2F%2Faistudio.google.com%2F&dsh=S-918882163%3A1776156869042251&flowEntry=ServiceLogin&flowName=GlifWebSignIn&ifkv=AT1y2_Xu2r3vBb8gR8c-HGzW2wSfMVmXzLxANkiyyjCgTHhA4JC8nFJxUSXbVBuAnKj1rDBwKal5&pstMsg=1",
+      "t": 1776156884903
+    },
+    {
+      "type": "click",
+      "selector": "span[jsname=\"V67aGc\"]",
+      "tag": "SPAN",
+      "text": "下一步",
+      "url": "https://accounts.google.com/v3/signin/challenge/pwd?TL=AIgtPP0Z50S4nxEw2YGA22hgl-Gej-NfjuIIddJiVEDyzUpLZqNGcHO6htzyUN7A&checkConnection=youtube%3A371&checkedDomains=youtube&cid=1&continue=https%3A%2F%2Faistudio.google.com%2F&dsh=S-918882163%3A1776156869042251&flowEntry=ServiceLogin&flowName=GlifWebSignIn&ifkv=AT1y2_Xu2r3vBb8gR8c-HGzW2wSfMVmXzLxANkiyyjCgTHhA4JC8nFJxUSXbVBuAnKj1rDBwKal5&pstMsg=1",
+      "t": 1776156884903
+    },
+    {
+      "type": "nav",
+      "url": "https://accounts.google.com/v3/signin/challenge/selection?TL=AIgtPP0Z50S4nxEw2YGA22hgl-Gej-NfjuIIddJiVEDyzUpLZqNGcHO6htzyUN7A&checkConnection=youtube%3A371&checkedDomains=youtube&continue=https%3A%2F%2Faistudio.google.com%2F&dsh=S-918882163%3A1776156869042251&flowEntry=ServiceLogin&flowName=GlifWebSignIn&ifkv=AT1y2_Xu2r3vBb8gR8c-HGzW2wSfMVmXzLxANkiyyjCgTHhA4JC8nFJxUSXbVBuAnKj1rDBwKal5&lid=2&pstMsg=1",
+      "t": 1776156885864
+    },
+    {
+      "type": "click",
+      "selector": "div[jsname=\"fmcmS\"]",
+      "tag": "DIV",
+      "text": "确认您的辅助邮箱",
+      "url": "https://accounts.google.com/v3/signin/challenge/selection?TL=AIgtPP0Z50S4nxEw2YGA22hgl-Gej-NfjuIIddJiVEDyzUpLZqNGcHO6htzyUN7A&checkConnection=youtube%3A371&checkedDomains=youtube&continue=https%3A%2F%2Faistudio.google.com%2F&dsh=S-918882163%3A1776156869042251&flowEntry=ServiceLogin&flowName=GlifWebSignIn&ifkv=AT1y2_Xu2r3vBb8gR8c-HGzW2wSfMVmXzLxANkiyyjCgTHhA4JC8nFJxUSXbVBuAnKj1rDBwKal5&lid=2&pstMsg=1",
+      "t": 1776156917377
+    },
+    {
+      "type": "nav",
+      "url": "https://accounts.google.com/v3/signin/challenge/kpe?TL=AIgtPP0Z50S4nxEw2YGA22hgl-Gej-NfjuIIddJiVEDyzUpLZqNGcHO6htzyUN7A&checkConnection=youtube%3A371&checkedDomains=youtube&cid=5&continue=https%3A%2F%2Faistudio.google.com%2F&dsh=S-918882163%3A1776156869042251&flowEntry=ServiceLogin&flowName=GlifWebSignIn&ifkv=AT1y2_Xu2r3vBb8gR8c-HGzW2wSfMVmXzLxANkiyyjCgTHhA4JC8nFJxUSXbVBuAnKj1rDBwKal5&pstMsg=1",
+      "t": 1776156917820
+    },
+    {
+      "type": "click",
+      "selector": "#knowledge-preregistered-email-response",
+      "tag": "INPUT",
+      "text": "",
+      "url": "https://accounts.google.com/v3/signin/challenge/kpe?TL=AIgtPP0Z50S4nxEw2YGA22hgl-Gej-NfjuIIddJiVEDyzUpLZqNGcHO6htzyUN7A&checkConnection=youtube%3A371&checkedDomains=youtube&cid=5&continue=https%3A%2F%2Faistudio.google.com%2F&dsh=S-918882163%3A1776156869042251&flowEntry=ServiceLogin&flowName=GlifWebSignIn&ifkv=AT1y2_Xu2r3vBb8gR8c-HGzW2wSfMVmXzLxANkiyyjCgTHhA4JC8nFJxUSXbVBuAnKj1rDBwKal5&pstMsg=1",
+      "t": 1776156919428
+    },
+    {
+      "type": "fill",
+      "selector": "#knowledge-preregistered-email-response",
+      "value": "__RECOVERY__",
+      "url": "https://accounts.google.com/v3/signin/challenge/kpe?TL=AIgtPP0Z50S4nxEw2YGA22hgl-Gej-NfjuIIddJiVEDyzUpLZqNGcHO6htzyUN7A&checkConnection=youtube%3A371&checkedDomains=youtube&cid=5&continue=https%3A%2F%2Faistudio.google.com%2F&dsh=S-918882163%3A1776156869042251&flowEntry=ServiceLogin&flowName=GlifWebSignIn&ifkv=AT1y2_Xu2r3vBb8gR8c-HGzW2wSfMVmXzLxANkiyyjCgTHhA4JC8nFJxUSXbVBuAnKj1rDBwKal5&pstMsg=1",
+      "t": 1776156930007
+    },
+    {
+      "type": "click",
+      "selector": "span[jsname=\"V67aGc\"]",
+      "tag": "SPAN",
+      "text": "下一步",
+      "url": "https://accounts.google.com/v3/signin/challenge/kpe?TL=AIgtPP0Z50S4nxEw2YGA22hgl-Gej-NfjuIIddJiVEDyzUpLZqNGcHO6htzyUN7A&checkConnection=youtube%3A371&checkedDomains=youtube&cid=5&continue=https%3A%2F%2Faistudio.google.com%2F&dsh=S-918882163%3A1776156869042251&flowEntry=ServiceLogin&flowName=GlifWebSignIn&ifkv=AT1y2_Xu2r3vBb8gR8c-HGzW2wSfMVmXzLxANkiyyjCgTHhA4JC8nFJxUSXbVBuAnKj1rDBwKal5&pstMsg=1",
+      "t": 1776156930857
+    },
+    {
+      "type": "nav",
+      "url": "https://gds.google.com/web/landing?ep=p&gdsid=-1812175925&tda=CAA&gm3e=false&authuser=0&hl=en&continue=https://accounts.google.com/ServiceLogin?continue%3Dhttps://aistudio.google.com/%26hl%3Den%26authuser%3D0%26passive%3Dtrue%26sarp%3D1%26aodrpl%3D1%26checkedDomains%3Dyoutube%26checkConnection%3Dyoutube:371%26pstMsg%3D1&rapt=AEjHL4P5kJWNa6Kwg1atPvwXnh-Wnq78B1ShkyV0z8LclzaB6vupRnuB9slZ8c-B2v10VpmPMLvSmC-nqh5ORO9vMTOQXtrTZA&pli=1",
+      "t": 1776156933369
+    },
+    {
+      "type": "ready",
+      "url": "https://gds.google.com/web/landing?ep=p&gdsid=-1812175925&tda=CAA&gm3e=false&authuser=0&hl=en&continue=https://accounts.google.com/ServiceLogin?continue%3Dhttps://aistudio.google.com/%26hl%3Den%26authuser%3D0%26passive%3Dtrue%26sarp%3D1%26aodrpl%3D1%26checkedDomains%3Dyoutube%26checkConnection%3Dyoutube:371%26pstMsg%3D1&rapt=AEjHL4P5kJWNa6Kwg1atPvwXnh-Wnq78B1ShkyV0z8LclzaB6vupRnuB9slZ8c-B2v10VpmPMLvSmC-nqh5ORO9vMTOQXtrTZA&pli=1",
+      "t": 1776156933395
+    },
+    {
+      "type": "nav",
+      "url": "https://gds.google.com/web/landing?ep=p&gdsid=-1812175925&tda=CAA&gm3e=false&authuser=0&hl=en&continue=https://accounts.google.com/ServiceLogin?continue%3Dhttps://aistudio.google.com/%26hl%3Den%26authuser%3D0%26passive%3Dtrue%26sarp%3D1%26aodrpl%3D1%26checkedDomains%3Dyoutube%26checkConnection%3Dyoutube:371%26pstMsg%3D1&rapt=AEjHL4P5kJWNa6Kwg1atPvwXnh-Wnq78B1ShkyV0z8LclzaB6vupRnuB9slZ8c-B2v10VpmPMLvSmC-nqh5ORO9vMTOQXtrTZA&pli=1",
+      "t": 1776156934367
+    },
+    {
+      "type": "nav",
+      "url": "https://gds.google.com/web/recoveryoptions?cardIndex=0&hl=en&authuser=0&tda=CAA&gdsid=-1812175925&continue=https%3A%2F%2Faccounts.google.com%2FServiceLogin%3Fcontinue%3Dhttps%3A%2F%2Faistudio.google.com%2F%26hl%3Den%26authuser%3D0%26passive%3Dtrue%26sarp%3D1%26aodrpl%3D1%26checkedDomains%3Dyoutube%26checkConnection%3Dyoutube%3A371%26pstMsg%3D1&rapt=AEjHL4P5kJWNa6Kwg1atPvwXnh-Wnq78B1ShkyV0z8LclzaB6vupRnuB9slZ8c-B2v10VpmPMLvSmC-nqh5ORO9vMTOQXtrTZA&ep=p",
+      "t": 1776156934367
+    },
+    {
+      "type": "click",
+      "selector": "span[jsname=\"V67aGc\"]",
+      "tag": "SPAN",
+      "text": "Save",
+      "url": "https://gds.google.com/web/recoveryoptions?cardIndex=0&hl=en&authuser=0&tda=CAA&gdsid=-1812175925&continue=https%3A%2F%2Faccounts.google.com%2FServiceLogin%3Fcontinue%3Dhttps%3A%2F%2Faistudio.google.com%2F%26hl%3Den%26authuser%3D0%26passive%3Dtrue%26sarp%3D1%26aodrpl%3D1%26checkedDomains%3Dyoutube%26checkConnection%3Dyoutube%3A371%26pstMsg%3D1&rapt=AEjHL4P5kJWNa6Kwg1atPvwXnh-Wnq78B1ShkyV0z8LclzaB6vupRnuB9slZ8c-B2v10VpmPMLvSmC-nqh5ORO9vMTOQXtrTZA&ep=p",
+      "t": 1776156950663
+    },
+    {
+      "type": "nav",
+      "url": "https://gds.google.com/web/recoveryoptions?cardIndex=0&hl=en&authuser=0&tda=CAA&gdsid=-1812175925&continue=https%3A%2F%2Faccounts.google.com%2FServiceLogin%3Fcontinue%3Dhttps%3A%2F%2Faistudio.google.com%2F%26hl%3Den%26authuser%3D0%26passive%3Dtrue%26sarp%3D1%26aodrpl%3D1%26checkedDomains%3Dyoutube%26checkConnection%3Dyoutube%3A371%26pstMsg%3D1&rapt=AEjHL4P5kJWNa6Kwg1atPvwXnh-Wnq78B1ShkyV0z8LclzaB6vupRnuB9slZ8c-B2v10VpmPMLvSmC-nqh5ORO9vMTOQXtrTZA&ep=p&asp=EgQIFhAC",
+      "t": 1776156951050
+    },
+    {
+      "type": "nav",
+      "url": "https://gds.google.com/web/homeaddress?cardIndex=1&hl=en&authuser=0&tda=CAA&gdsid=-1812175925&continue=https%3A%2F%2Faccounts.google.com%2FServiceLogin%3Fcontinue%3Dhttps%3A%2F%2Faistudio.google.com%2F%26hl%3Den%26authuser%3D0%26passive%3Dtrue%26sarp%3D1%26aodrpl%3D1%26checkedDomains%3Dyoutube%26checkConnection%3Dyoutube%3A371%26pstMsg%3D1&asp=EgQIFhAC&rapt=AEjHL4P5kJWNa6Kwg1atPvwXnh-Wnq78B1ShkyV0z8LclzaB6vupRnuB9slZ8c-B2v10VpmPMLvSmC-nqh5ORO9vMTOQXtrTZA&ep=p",
+      "t": 1776156951077
+    },
+    {
+      "type": "click",
+      "selector": "span[jsname=\"V67aGc\"]",
+      "tag": "SPAN",
+      "text": "Skip",
+      "url": "https://gds.google.com/web/homeaddress?cardIndex=1&hl=en&authuser=0&tda=CAA&gdsid=-1812175925&continue=https%3A%2F%2Faccounts.google.com%2FServiceLogin%3Fcontinue%3Dhttps%3A%2F%2Faistudio.google.com%2F%26hl%3Den%26authuser%3D0%26passive%3Dtrue%26sarp%3D1%26aodrpl%3D1%26checkedDomains%3Dyoutube%26checkConnection%3Dyoutube%3A371%26pstMsg%3D1&asp=EgQIFhAC&rapt=AEjHL4P5kJWNa6Kwg1atPvwXnh-Wnq78B1ShkyV0z8LclzaB6vupRnuB9slZ8c-B2v10VpmPMLvSmC-nqh5ORO9vMTOQXtrTZA&ep=p",
+      "t": 1776156963792
+    },
+    {
+      "type": "nav",
+      "url": "https://aistudio.google.com/?pli=1",
+      "t": 1776156965017
+    },
+    {
+      "type": "ready",
+      "url": "https://aistudio.google.com/?pli=1",
+      "t": 1776156965026
+    },
+    {
+      "type": "nav",
+      "url": "https://aistudio.google.com/prompts/new_chat",
+      "t": 1776156966392
+    }
+  ],
+  "branches": [
+    {
+      "id": "challenge_iap_phone_only",
+      "match": {
+        "urlIncludes": "accounts.google.com/v3/signin/challenge/iap"
+      },
+      "action": "skip-account",
+      "reason": "phone-only verification (no recovery email option)"
+    },
+    {
+      "id": "aistudio_agreements",
+      "match": {
+        "domSelector": "#mat-mdc-checkbox-0-input"
+      },
+      "action": "events",
+      "events": [
+        {
+          "type": "click",
+          "selector": "#mat-mdc-checkbox-0-input",
+          "tag": "INPUT",
+          "text": "",
+          "url": "https://aistudio.google.com/prompts/new_chat"
+        },
+        {
+          "type": "click",
+          "selector": "button[aria-label=\"Accept\\ terms\\ of\\ service\"]",
+          "tag": "BUTTON",
+          "text": "Continue",
+          "url": "https://aistudio.google.com/prompts/new_chat"
+        }
+      ]
+    },
+    {
+      "id": "web_landing",
+      "match": {
+        "urlIncludes": "gds.google.com/web/landing"
+      },
+      "action": "events",
+      "events": [
+        {
+          "type": "click",
+          "selector": "span[jsname=\"V67aGc\"]",
+          "tag": "SPAN",
+          "text": "Save",
+          "url": "https://gds.google.com/web/recoveryoptions?cardIndex=0&hl=en&authuser=0&tda=CAA&gdsid=-434076593&continue=https%3A%2F%2Faccounts.google.com%2FServiceLogin%3Fcontinue%3Dhttps%3A%2F%2Faistudio.google.com%2F%26hl%3Den%26authuser%3D0%26passive%3Dtrue%26sarp%3D1%26aodrpl%3D1%26checkedDomains%3Dyoutube%26checkConnection%3Dyoutube%3A378%26pstMsg%3D1&rapt=AEjHL4NIZMrsOKL09NAos5oft1DbAHZXebcSiR-u6mylKXqwTy-OvvEHOITwHnqdHcqzxXwIRyq474okgKFTjMWrD7URghpe4Q&ep=p",
+          "t": 1776158436928
+        }
+      ]
+    }
+  ]
+}

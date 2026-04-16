@@ -30,6 +30,11 @@ auth-*.json
 users.csv
 cache/
 
+# Recorder (persistent profile + recorded flows + failure log)
+.browser-profiles/
+scripts/recorder/flows/
+scripts/recorder/failed.csv
+
 # Usage statistics data
 data/
 
@@ -41,3 +46,4 @@ ui/dist/
 test/
 debug_*.png
 debug_*.html
+.ace-tool/

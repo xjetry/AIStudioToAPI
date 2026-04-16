@@ -1008,6 +1008,7 @@ class BrowserManager {
         const totalTimeoutMs = options.totalTimeoutMs ?? 2500;
         const intervalMs = options.intervalMs ?? 350;
         const startedAt = Date.now();
+        let primedOnce = false;
 
         while (Date.now() - startedAt < totalTimeoutMs) {
             if (page.isClosed?.()) return false;
@@ -1017,6 +1018,7 @@ class BrowserManager {
                 const moveX = Math.floor(Math.random() * Math.max(100, vp.width * 0.4));
                 const moveY = Math.floor(Math.random() * Math.max(100, vp.height * 0.4));
                 await this._simulateHumanMovement(page, moveX, moveY);
+                primedOnce = true;
             } catch (err) {
                 this.logger.debug(`${logPrefix} human movement failed: ${err.message}`);
             }
@@ -1032,6 +1034,12 @@ class BrowserManager {
             }
 
             await page.waitForTimeout(intervalMs).catch(() => {});
+        }
+
+        if (primedOnce) {
+            contextData.dispatchReady = true;
+            this.logger.info(`${logPrefix} dispatch-ready after focus/human wake cycle.`);
+            return true;
         }
 
         return contextData.dispatchReady === true;

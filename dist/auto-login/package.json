@@ -1,0 +1,17 @@
+{
+  "name": "aistudio-auto-login",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Record-and-replay automation for batch logging into Google AI Studio accounts and exporting Playwright storage state.",
+  "scripts": {
+    "record": "node record.js",
+    "replay": "node replay.js",
+    "postinstall": "patchright install chromium"
+  },
+  "dependencies": {
+    "patchright": "^1.59.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
