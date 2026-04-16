@@ -229,15 +229,6 @@ class AuthSwitcher {
                         `🔄 [Auth] Attempting to switch to account #${accountIndex} (${attemptNumber}/${tryCount} accounts)...`
                     );
 
-                    // EXPERIMENT: Rolling evict temporarily disabled. The
-                    // hypothesis from the 2-context vs 4-context test is that
-                    // calling closeContext(graceful) on a just-rolled-off
-                    // account while the rest of the pool is processing new
-                    // requests blocks the Firefox process JS enough that
-                    // those new requests stall. If this test with rolling
-                    // evict off goes 22/22 we know the eviction is the
-                    // culprit and can redesign it (e.g., defer evict until
-                    // pool has been idle for N seconds).
                     try {
                         await this.browserManager.switchAccount(accountIndex);
                         this.resetCounters();
@@ -400,6 +391,8 @@ class AuthSwitcher {
             this.config.failureThreshold > 0 && this.failureCount >= this.config.failureThreshold;
 
         if (isImmediateSwitch || isThresholdReached) {
+            const previousAuthIndex = this.currentAuthIndex;
+
             if (isImmediateSwitch) {
                 this.logger.warn(
                     `🔴 [Auth] Received status code ${errorDetails.status}, triggering immediate account switch...`
@@ -422,6 +415,22 @@ class AuthSwitcher {
                 const successMessage = `🔄 Account switch completed, now using account #${this.currentAuthIndex}.`;
                 this.logger.info(`[Auth] ${successMessage}`);
                 if (sendErrorCallback) sendErrorCallback(successMessage);
+
+                // Evict the rate-limited account from the pool and preload
+                // the next rotation candidate into the freed slot. Without
+                // this the 429/503'd account keeps occupying a pool slot,
+                // blocking new accounts from warming up.
+                if (
+                    isImmediateSwitch &&
+                    previousAuthIndex >= 0 &&
+                    previousAuthIndex !== this.currentAuthIndex
+                ) {
+                    this.browserManager.evictUsedAccountAndPreloadNext(previousAuthIndex).catch(err => {
+                        this.logger.warn(
+                            `[Auth] Background eviction of rate-limited account #${previousAuthIndex} failed: ${err.message}`
+                        );
+                    });
+                }
             } catch (error) {
                 let userMessage = `❌ Fatal error: Unknown switching error occurred: ${error.message}`;
 
