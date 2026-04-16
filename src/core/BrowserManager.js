@@ -84,14 +84,6 @@ class BrowserManager {
         // Map: authIndex -> { success: boolean, failed: boolean }
         this._wsInitState = new Map();
 
-        // _contextCreationLock was the shared-browser serialization point for
-        // the newContext + addInitScript + newPage setup phase. With one
-        // Firefox per account, each browser only ever sees a single
-        // newContext call from a single _initializeContext invocation, so the
-        // lock is unused now. Retained as a no-op resolved promise for any
-        // straggler call sites.
-        this._contextCreationLock = Promise.resolve();
-
         // Active rolled-off monitors (authIndex -> intervalId). Used by
         // _monitorRolledOffContext to trace whether a just-rolled-off page
         // is actually processing its queued work or sitting frozen.
@@ -357,28 +349,6 @@ class BrowserManager {
     }
 
     /**
-     * Get pool target indices based on current account and rotation order
-     * @param {number} maxContexts - Max pool size (0 = unlimited)
-     * @returns {number[]} Target indices for the pool
-     */
-    // _getPoolTargetIndices(maxContexts) {
-    //     const rotation = this.authSource.getRotationIndices();
-    //     if (rotation.length === 0) return [];
-    //     if (maxContexts === 0 || maxContexts >= rotation.length) return [...rotation];
-    //
-    //     const currentCanonical =
-    //         this._currentAuthIndex >= 0 ? this.authSource.getCanonicalIndex(this._currentAuthIndex) : null;
-    //     const startPos = currentCanonical !== null ? rotation.indexOf(currentCanonical) : -1;
-    //     const start = startPos >= 0 ? startPos : 0;
-    //
-    //     const result = [];
-    //     for (let i = 0; i < maxContexts && i < rotation.length; i++) {
-    //         result.push(rotation[(start + i) % rotation.length]);
-    //     }
-    //     return result;
-    // }
-
-    /**
      * Interface: Notify user activity
      * Used to force wake up the Launch detection when a request comes in
      */
@@ -514,94 +484,6 @@ class BrowserManager {
                         Object.defineProperty(window, 'onfocus', { configurable: true, get: () => null, set: () => {} });
                     } catch (_) {}
 
-                    // 0.5. Global fetch probe. The actual in-page client code is
-                    // currently served by the remote Canvas app, not the local
-                    // scripts/client/build.js source file. Instrument fetch at
-                    // the browser runtime boundary so we can observe whether
-                    // requests on rolled-off contexts actually start / finish.
-                    try {
-                        if (!window.__proxyFetchProbeInstalled) {
-                            window.__proxyFetchProbeInstalled = true;
-                            let fetchSeq = 0;
-                            const installFetchProbe = () => {
-                                if (typeof window.fetch !== 'function') return;
-                                if (window.fetch.__proxyFetchProbeWrapped) return;
-
-                                const currentFetch = window.fetch.bind(window);
-                                const wrappedFetch = async function(resource, init) {
-                                    const probeId = ++fetchSeq;
-                                    let url = '';
-                                    let method = 'GET';
-                                    try {
-                                        if (resource instanceof Request) {
-                                            url = resource.url || '';
-                                            method = resource.method || method;
-                                        } else {
-                                            url = String(resource || '');
-                                            method = (init && init.method) || method;
-                                        }
-                                    } catch (_) {}
-
-                                    const shouldLog =
-                                        typeof url === 'string' &&
-                                        (url.includes('generativelanguage.googleapis.com') ||
-                                            url.includes('alkalimakersuite-pa.clients6.google.com'));
-
-                                    if (shouldLog) {
-                                        console.log(
-                                            '[ProxyClient] [ProxyFetchProbe] START authIndex=${authIndex} probe=' +
-                                                probeId +
-                                                ' method=' +
-                                                method +
-                                                ' url=' +
-                                                url
-                                        );
-                                    }
-
-                                    try {
-                                        const response = await currentFetch(resource, init);
-                                        if (shouldLog) {
-                                            console.log(
-                                                '[ProxyClient] [ProxyFetchProbe] END authIndex=${authIndex} probe=' +
-                                                    probeId +
-                                                    ' status=' +
-                                                    response.status +
-                                                    ' ok=' +
-                                                    response.ok +
-                                                    ' url=' +
-                                                    url
-                                            );
-                                        }
-                                        return response;
-                                    } catch (err) {
-                                        if (shouldLog) {
-                                            const errName = err && err.name ? err.name : 'Error';
-                                            const errMsg = err && err.message ? err.message : String(err);
-                                            console.log(
-                                                '[ProxyClient] [ProxyFetchProbe] ERROR authIndex=${authIndex} probe=' +
-                                                    probeId +
-                                                    ' name=' +
-                                                    errName +
-                                                    ' message=' +
-                                                    errMsg +
-                                                    ' url=' +
-                                                    url
-                                            );
-                                        }
-                                        throw err;
-                                    }
-                                };
-
-                                wrappedFetch.__proxyFetchProbeWrapped = true;
-                                wrappedFetch.__proxyFetchProbeOriginal = currentFetch;
-                                window.fetch = wrappedFetch;
-                            };
-
-                            installFetchProbe();
-                            setInterval(installFetchProbe, 1000);
-                        }
-                    } catch (_) {}
-
                     // 1. Mask WebDriver property
                     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 
@@ -671,115 +553,6 @@ class BrowserManager {
             // Ignore movement errors if page is closed
         }
     }
-
-    /**
-     * Feature: Smart "Code" Button Clicking
-     * Tries multiple selectors (Code, Develop, Edit, Icons) to be robust against UI changes.
-     */
-    // async _smartClickCode(page) {
-    //     const selectors = [
-    //         // Priority 1: Exact text match (Fastest)
-    //         'button:text("Code")',
-    //         // Priority 2: Alternative texts used by Google
-    //         'button:text("Develop")',
-    //         'button:text("Edit")',
-    //         // Priority 3: Fuzzy attribute matching
-    //         'button[aria-label*="Code"]',
-    //         'button[aria-label*="code"]',
-    //         // Priority 4: Icon based
-    //         'button mat-icon:text("code")',
-    //         'button span:has-text("Code")',
-    //     ];
-    //
-    //     this.logger.info('[Browser] Trying to locate "Code" entry point using smart selectors...');
-    //
-    //     for (const selector of selectors) {
-    //         try {
-    //             // Use a short timeout for quick fail-over
-    //             const element = page.locator(selector).first();
-    //             if (await element.isVisible({ timeout: 2000 })) {
-    //                 this.logger.info(`[Browser] ✅ Smart match: "${selector}", clicking...`);
-    //                 // Direct click with force as per new logic
-    //                 await element.click({ force: true, timeout: 10000 });
-    //                 return true;
-    //             }
-    //         } catch (e) {
-    //             // Ignore timeout for single selector, try next
-    //         }
-    //     }
-    //
-    //     throw new Error('Unable to find "Code" button or alternatives (Smart Click Failed)');
-    // }
-
-    /**
-     * Helper: Load and configure build.js script content
-     * Applies environment-specific configurations (TARGET_DOMAIN, LOG_LEVEL)
-     * @returns {string} Configured build.js script content
-     */
-    // _loadAndConfigureBuildScript() {
-    //     let buildScriptContent = fs.readFileSync(
-    //         path.join(__dirname, "..", "..", "scripts", "client", "build.js"),
-    //         "utf-8"
-    //     );
-    //
-    //     if (process.env.TARGET_DOMAIN) {
-    //         const lines = buildScriptContent.split("\n");
-    //         let domainReplaced = false;
-    //         for (let i = 0; i < lines.length; i++) {
-    //             if (lines[i].includes("this.targetDomain =")) {
-    //                 this.logger.info(`[Config] Found targetDomain line: ${lines[i]}`);
-    //                 lines[i] = `        this.targetDomain = "${process.env.TARGET_DOMAIN}";`;
-    //                 this.logger.info(`[Config] Replaced with: ${lines[i]}`);
-    //                 domainReplaced = true;
-    //                 break;
-    //             }
-    //         }
-    //         if (domainReplaced) {
-    //             buildScriptContent = lines.join("\n");
-    //         } else {
-    //             this.logger.warn("[Config] Failed to find targetDomain line in build.js, ignoring.");
-    //         }
-    //     }
-    //
-    //     if (process.env.WS_PORT) {
-    //         // WS_PORT environment variable is no longer supported
-    //         this.logger.error(
-    //             `[Config] ❌ WS_PORT environment variable is deprecated and no longer supported. ` +
-    //                 `The WebSocket port is now fixed at 9998. Please remove WS_PORT from your .env file.`
-    //         );
-    //         // Do not modify the default WS_PORT - keep it at 9998
-    //     }
-    //
-    //     // Inject LOG_LEVEL configuration into build.js
-    //     // Read from LoggingService.currentLevel instead of environment variable
-    //     // This ensures runtime log level changes are respected when browser restarts
-    //     const LoggingService = require("../utils/LoggingService");
-    //     const currentLogLevel = LoggingService.currentLevel; // 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR
-    //     const currentLogLevelName = LoggingService.getLevel(); // "DEBUG", "INFO", etc.
-    //
-    //     if (currentLogLevel !== 1) {
-    //         const lines = buildScriptContent.split("\n");
-    //         let levelReplaced = false;
-    //         for (let i = 0; i < lines.length; i++) {
-    //             // Match "currentLevel: <number>," pattern, ignoring comments
-    //             // This is more robust than looking for specific comments like "// Default: INFO"
-    //             if (/^\s*currentLevel:\s*\d+/.test(lines[i])) {
-    //                 this.logger.info(`[Config] Found LOG_LEVEL config line: ${lines[i]}`);
-    //                 lines[i] = `    currentLevel: ${currentLogLevel}, // Injected: ${currentLogLevelName}`;
-    //                 this.logger.info(`[Config] Replaced with: ${lines[i]}`);
-    //                 levelReplaced = true;
-    //                 break;
-    //             }
-    //         }
-    //         if (levelReplaced) {
-    //             buildScriptContent = lines.join("\n");
-    //         } else {
-    //             this.logger.warn("[Config] Failed to find LOG_LEVEL config line in build.js, using default INFO.");
-    //         }
-    //     }
-    //
-    //     return buildScriptContent;
-    // }
 
     /**
      * Deep-activate a pool context so it is in "launched" state before
@@ -987,16 +760,6 @@ class BrowserManager {
         });
         this._startHealthMonitor();
         this._startBackgroundWakeup();
-        // EXPERIMENT: _sendActiveTrigger disabled during FastSwitch. It fires
-        // an extra `fetch('https://generativelanguage.googleapis.com/...')`
-        // from within the page, which is the same origin the user's request
-        // fetch is about to hit. Diagnostic monitor evidence shows that
-        // FastSwitch-activated contexts receive the WS request but their
-        // in-page fetch never resolves, while the initial-activated context
-        // #3 (whose trigger fired at boot when nothing else competed) drains
-        // normally. Hypothesis: the trigger fetch and user fetch land on the
-        // same HTTP/2 connection under Camoufox, where the trigger blocks.
-        // this._sendActiveTrigger("[Browser]", pg);
     }
 
     async _primeContextForDispatch(authIndex, page, options = {}) {
@@ -1213,48 +976,6 @@ class BrowserManager {
     }
 
     /**
-     * Helper: Verify navigation to correct page and retry if needed
-     * Throws error on failure, which will be caught by the caller's try-catch block
-     * @param {string} logPrefix - Log prefix for messages (e.g., "[Browser]" or "[Reconnect]")
-     * @throws {Error} If navigation fails after retry
-     */
-    // async _verifyAndRetryNavigation(logPrefix = "[Browser]") {
-    //     let currentUrl = this.page.url();
-    //
-    //     if (!currentUrl.includes(this.expectedAppId)) {
-    //         this.logger.warn(`${logPrefix} ⚠️ Page redirected to: ${currentUrl}`);
-    //         this.logger.info(`${logPrefix} Expected app ID: ${this.expectedAppId}`);
-    //         this.logger.info(`${logPrefix} Attempting to navigate again...`);
-    //
-    //         // Reset WebSocket initialization flags before re-navigation
-    //         this._wsInitSuccess = false;
-    //         this._wsInitFailed = false;
-    //
-    //         // Wait a bit before retrying
-    //         await this.page.waitForTimeout(2000);
-    //
-    //         // Try navigating again
-    //         await this.page.goto(this.targetUrl, {
-    //             timeout: 180000,
-    //             waitUntil: "domcontentloaded",
-    //         });
-    //         await this.page.waitForTimeout(2000);
-    //
-    //         // Check URL again
-    //         currentUrl = this.page.url();
-    //         if (!currentUrl.includes(this.expectedAppId)) {
-    //             this.logger.error(`${logPrefix} ❌ Still on wrong page after retry: ${currentUrl}`);
-    //             throw new Error(
-    //                 `Failed to navigate to correct page. Current URL: ${currentUrl}, Expected app ID: ${this.expectedAppId}`
-    //             );
-    //         } else {
-    //             this.logger.info(`${logPrefix} ✅ Successfully navigated to correct page on retry: ${currentUrl}`);
-    //         }
-    //     } else {
-    //         this.logger.info(`${logPrefix} ✅ Confirmed on correct page: ${currentUrl}`);
-    //     }
-    // }
-
     /**
      * Helper: Check page status and detect various error conditions
      * Detects: cookie expiration, region restrictions, 403 errors, page load failures
@@ -2242,10 +1963,22 @@ class BrowserManager {
                 batch.map(idx => this._initializeContext(idx, true)) // Mark as background task
             );
 
+            const primeTasks = [];
             results.forEach((res, i) => {
                 const idx = batch[i];
                 if (res.status === "fulfilled") {
-                    this.logger.info(`✅ [ContextPool] Background context #${idx} ready.`);
+                    this.logger.info(`✅ [ContextPool] Background context #${idx} ready, priming for dispatch...`);
+                    const ctxData = this.contexts.get(idx);
+                    if (ctxData?.page && !ctxData.page.isClosed?.()) {
+                        primeTasks.push(
+                            this._primeContextForDispatch(idx, ctxData.page, {
+                                logPrefix: `[BackgroundPrime#${idx}]`,
+                                totalTimeoutMs: 3000,
+                            }).catch(err => {
+                                this.logger.warn(`[ContextPool] Background prime for #${idx} failed: ${err.message}`);
+                            })
+                        );
+                    }
                 } else {
                     const isAbortError = isContextAbortedError(res.reason);
                     if (isAbortError) {
@@ -2257,6 +1990,14 @@ class BrowserManager {
                     }
                 }
             });
+
+            // Prime newly-initialized contexts so they become dispatch-ready.
+            // Without this, background-preloaded contexts stay dispatchReady=false
+            // and _pickDispatchAuthIndex never selects them, causing single-account
+            // regression after a 429/503 switch.
+            if (primeTasks.length > 0) {
+                await Promise.allSettled(primeTasks);
+            }
             // Note: initializingContexts and abortedContexts cleanup is handled in _initializeContext's finally block
         }
 
@@ -2929,11 +2670,7 @@ class BrowserManager {
         }
 
         // [Auth Switch] Fire-and-forget: save current auth data in the
-        // background so rapid usage-based switches don't block on storageState
-        // (which is serialized via _contextCreationLock). Queueing the auth
-        // save behind the lock during a FastSwitch burst held up the rest of
-        // the rolling window and starved in-flight requests on the rolling-off
-        // contexts long enough that their graceful drain timed out.
+        // background so rapid usage-based switches don't block on storageState.
         if (
             this._currentAuthIndex >= 0 &&
             this._currentAuthIndex !== authIndex &&
