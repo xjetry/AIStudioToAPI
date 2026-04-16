@@ -243,11 +243,15 @@ class ConnectionRegistry extends EventEmitter {
         try {
             const parsedMessage = JSON.parse(messageData);
             const requestId = parsedMessage.request_id;
+            const eventType = parsedMessage.event_type || "unknown";
             if (!requestId) {
                 this.logger.warn("[Server] Received invalid message: missing request_id");
                 return;
             }
             const entry = this.messageQueues.get(requestId);
+            this.logger.info(
+                `[Registry-DBG] RX authIndex=${messageAuthIndex} request_id=${requestId} attempt=${parsedMessage.request_attempt_id || "missing"} type=${eventType} queue=${entry ? "present" : "missing"} boundAuth=${entry?.authIndex ?? "missing"} boundAttempt=${entry?.requestAttemptId || "missing"}`
+            );
             if (entry) {
                 // Verify that the message comes from the correct authIndex
                 if (messageAuthIndex !== entry.authIndex) {
@@ -280,10 +284,21 @@ class ConnectionRegistry extends EventEmitter {
         switch (event_type) {
             case "response_headers":
             case "chunk":
+                this.logger.info(
+                    `[Registry-DBG] ROUTE request_id=${message.request_id} attempt=${message.request_attempt_id || "missing"} type=${event_type}`
+                );
+                queue.enqueue(message);
+                break;
             case "error":
+                this.logger.info(
+                    `[Registry-DBG] ROUTE request_id=${message.request_id} attempt=${message.request_attempt_id || "missing"} type=${event_type}`
+                );
                 queue.enqueue(message);
                 break;
             case "stream_close":
+                this.logger.info(
+                    `[Registry-DBG] ROUTE request_id=${message.request_id} attempt=${message.request_attempt_id || "missing"} type=STREAM_END`
+                );
                 queue.enqueue({ type: "STREAM_END" });
                 break;
             default:
@@ -433,11 +448,15 @@ class ConnectionRegistry extends EventEmitter {
             this.messageQueues.delete(requestId);
         }
 
-        const queue = new MessageQueue();
+        const queue = new MessageQueue(undefined, {
+            label: `request=${requestId} authIndex=${authIndex} attempt=${requestAttemptId || "missing"}`,
+            log: message => this.logger.info(message),
+        });
         // Add timestamp for stale queue detection
         this.messageQueues.set(requestId, {
             authIndex,
             createdAt: Date.now(),
+            issued: false,
             queue,
             requestAttemptId,
         });
@@ -488,6 +507,84 @@ class ConnectionRegistry extends EventEmitter {
             if (entry.authIndex === authIndex) count++;
         }
         return count;
+    }
+
+    /**
+     * Count in-flight requests for an account that have not yet been observed
+     * to enter the browser network stack.
+     * @param {number} authIndex
+     * @returns {number}
+     */
+    getUnissuedCountForAuth(authIndex) {
+        let count = 0;
+        for (const entry of this.messageQueues.values()) {
+            if (entry.authIndex === authIndex && entry.issued !== true) count++;
+        }
+        return count;
+    }
+
+    /**
+     * Mark the oldest unissued request for an account as "issued" once the
+     * browser page has emitted a real ProxyUnaryCall network request.
+     * @param {number} authIndex
+     * @returns {string|null} requestId that was marked, or null if none
+     */
+    markNextUnissuedRequestForAuthIssued(authIndex) {
+        let targetRequestId = null;
+        let targetEntry = null;
+        for (const [requestId, entry] of this.messageQueues.entries()) {
+            if (entry.authIndex !== authIndex) continue;
+            if (entry.issued === true) continue;
+            if (!targetEntry || entry.createdAt < targetEntry.createdAt) {
+                targetRequestId = requestId;
+                targetEntry = entry;
+            }
+        }
+
+        if (!targetEntry || !targetRequestId) {
+            this.logger.debug(`[Registry] No unissued request to mark for authIndex=${authIndex}`);
+            return null;
+        }
+
+        targetEntry.issued = true;
+        this.logger.info(
+            `[Registry] Marked request ${targetRequestId} as issued for authIndex=${authIndex}. Remaining unissued=${this.getUnissuedCountForAuth(authIndex)}`
+        );
+        return targetRequestId;
+    }
+
+    /**
+     * Wait until all currently queued requests for an account have been
+     * observed entering the browser network layer, or timeout.
+     * @param {number} authIndex
+     * @param {number} [timeoutMs=15000]
+     * @param {number} [pollMs=100]
+     * @returns {Promise<{issued: boolean, remaining: number, elapsedMs: number}>}
+     */
+    async waitForAuthIssued(authIndex, timeoutMs = 15000, pollMs = 100) {
+        const start = Date.now();
+        const deadline = start + Math.max(0, timeoutMs);
+        let remaining = this.getUnissuedCountForAuth(authIndex);
+        if (remaining === 0) {
+            return { issued: true, elapsedMs: 0, remaining: 0 };
+        }
+        this.logger.info(
+            `[Registry] Waiting for ${remaining} request(s) on account #${authIndex} to enter network layer (timeout=${timeoutMs}ms)`
+        );
+        while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, pollMs));
+            remaining = this.getUnissuedCountForAuth(authIndex);
+            if (remaining === 0) {
+                const elapsedMs = Date.now() - start;
+                this.logger.info(`[Registry] All requests issued for account #${authIndex} after ${elapsedMs}ms`);
+                return { issued: true, elapsedMs, remaining: 0 };
+            }
+        }
+        const elapsedMs = Date.now() - start;
+        this.logger.warn(
+            `[Registry] Issue wait timeout for account #${authIndex}: ${remaining} request(s) still not issued after ${elapsedMs}ms`
+        );
+        return { issued: false, elapsedMs, remaining };
     }
 
     /**

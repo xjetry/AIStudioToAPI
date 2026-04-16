@@ -31,6 +31,21 @@ class AuthSwitcher {
         this.usageCount = 0;
         this._isSystemBusy = false;
         this._switchStartedAt = null;
+
+        // Cooldown state for usage-based auto-switch. Under burst load with a
+        // small SWITCH_ON_USES, switches would otherwise fire in microsecond
+        // cascades (e.g., 3→4→5→6→7 in <1s), which is fatal for Camoufox
+        // because the single Firefox process pauses JS on just-rolled-off
+        // contexts before their in-flight fetches can even start running.
+        // Enforcing a minimum gap between auto-switches gives each rolled-
+        // off context CPU time to actually kick off its batch of requests.
+        this._lastAutoSwitchFiredAt = 0;
+        this._pendingAutoSwitchTimer = null;
+    }
+
+    get autoSwitchCooldownMs() {
+        const v = this.config.autoSwitchCooldownMs;
+        return typeof v === "number" && v >= 0 ? v : 2000;
     }
 
     get currentAuthIndex() {
@@ -107,7 +122,9 @@ class AuthSwitcher {
     //     return available[nextIndexInArray];
     // }
 
-    async switchToNextAuth() {
+    async switchToNextAuth(options = {}) {
+        const waitForCurrentIssued = options.waitForCurrentIssued === true;
+        const issueWaitTimeoutMs = Math.max(1000, options.issueWaitTimeoutMs || 15000);
         const available = this.authSource.getRotationIndices();
 
         if (available.length === 0) {
@@ -160,6 +177,30 @@ class AuthSwitcher {
                 const startIndex = hasCurrentAccount ? currentIndexInArray : 0;
                 const originalStartAccount = hasCurrentAccount ? available[startIndex] : null;
 
+                if (waitForCurrentIssued && hasCurrentAccount && this.browserManager.connectionRegistry) {
+                    const unissued = this.browserManager.connectionRegistry.getUnissuedCountForAuth(
+                        this.currentAuthIndex
+                    );
+                    if (unissued > 0) {
+                        this.logger.info(
+                            `[Auth] Usage-based switch waiting for account #${this.currentAuthIndex} to issue ${unissued} request(s) before switching...`
+                        );
+                        try {
+                            const result = await this.browserManager.connectionRegistry.waitForAuthIssued(
+                                this.currentAuthIndex,
+                                issueWaitTimeoutMs
+                            );
+                            this.logger.info(
+                                `[Auth] Issue wait finished for account #${this.currentAuthIndex}: issued=${result.issued} remaining=${result.remaining} elapsed=${result.elapsedMs}ms`
+                            );
+                        } catch (error) {
+                            this.logger.warn(
+                                `[Auth] waitForAuthIssued failed for account #${this.currentAuthIndex}: ${error.message}`
+                            );
+                        }
+                    }
+                }
+
                 this.logger.info("==================================================");
                 this.logger.info(`🔄 [Auth] Multi-account mode: Starting intelligent account switching`);
                 this.logger.info(`   • Current account: #${this.currentAuthIndex}`);
@@ -188,11 +229,19 @@ class AuthSwitcher {
                         `🔄 [Auth] Attempting to switch to account #${accountIndex} (${attemptNumber}/${tryCount} accounts)...`
                     );
 
+                    // EXPERIMENT: Rolling evict temporarily disabled. The
+                    // hypothesis from the 2-context vs 4-context test is that
+                    // calling closeContext(graceful) on a just-rolled-off
+                    // account while the rest of the pool is processing new
+                    // requests blocks the Firefox process JS enough that
+                    // those new requests stall. If this test with rolling
+                    // evict off goes 22/22 we know the eviction is the
+                    // culprit and can redesign it (e.g., defer evict until
+                    // pool has been idle for N seconds).
                     try {
-                        // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
-                        await this.browserManager.preCleanupForSwitch(accountIndex);
                         await this.browserManager.switchAccount(accountIndex);
                         this.resetCounters();
+
                         this.browserManager.rebalanceContextPool().catch(err => {
                             this.logger.error(`[Auth] Background rebalance failed: ${err.message}`);
                         });
@@ -224,8 +273,8 @@ class AuthSwitcher {
                     this.logger.warn("==================================================");
 
                     try {
-                        // Pre-cleanup: remove excess contexts BEFORE creating new one to avoid exceeding maxContexts
-                        await this.browserManager.preCleanupForSwitch(originalStartAccount);
+                        // Fallback to the original account. We do NOT pre-cleanup:
+                        // the original account is (by definition) already loaded.
                         await this.browserManager.switchAccount(originalStartAccount);
                         this.resetCounters();
                         this.browserManager.rebalanceContextPool().catch(err => {

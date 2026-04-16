@@ -37,7 +37,13 @@ class BrowserManager {
         this.logger = logger;
         this.config = config;
         this.authSource = authSource;
-        this.browser = null;
+        // Per-account Firefox processes. Under a single shared Firefox, non-primary
+        // tabs' in-page fetch() gets held by the renderer's global scheduler once
+        // traffic goes concurrent — only the foremost tab drains. We give each
+        // account its own Firefox process so every context is the primary tab of
+        // its own browser and no cross-account scheduler contention exists.
+        // Map<authIndex, BrowserInstance>.
+        this.browsers = new Map();
 
         // Multi-context architecture: Store all initialized contexts
         // Map: authIndex -> {context, page, healthMonitorInterval}
@@ -48,6 +54,8 @@ class BrowserManager {
         this.abortedContexts = new Set(); // Indices that should be aborted during background init
         this._backgroundPreloadTask = null; // Current background preload task promise (only one at a time)
         this._backgroundPreloadAbort = false; // Flag to signal background task to abort
+        this._pendingBackgroundPreloadRequest = null; // Follow-up preload request to run after the current task
+        this._dispatchPrepTasks = new Map(); // Dedup per-auth dispatch wakeups
 
         // Legacy single context references (for backward compatibility)
         this.context = null;
@@ -76,13 +84,18 @@ class BrowserManager {
         // Map: authIndex -> { success: boolean, failed: boolean }
         this._wsInitState = new Map();
 
-        // Serializes the browser-level context creation phase (newContext +
-        // addInitScript + newPage). Camoufox/Playwright Firefox appears to
-        // deadlock when these calls race across parallel _initializeContext
-        // invocations — only the last caller progresses. Serializing just this
-        // fast setup phase still lets the slow phases (goto, WS init wait)
-        // run in parallel across contexts.
+        // _contextCreationLock was the shared-browser serialization point for
+        // the newContext + addInitScript + newPage setup phase. With one
+        // Firefox per account, each browser only ever sees a single
+        // newContext call from a single _initializeContext invocation, so the
+        // lock is unused now. Retained as a no-op resolved promise for any
+        // straggler call sites.
         this._contextCreationLock = Promise.resolve();
+
+        // Active rolled-off monitors (authIndex -> intervalId). Used by
+        // _monitorRolledOffContext to trace whether a just-rolled-off page
+        // is actually processing its queued work or sitting frozen.
+        this._rolledOffMonitors = new Map();
 
         // Idle auto-refill: after ~5s of no WebUI account-related activity,
         // if the pool has free capacity, preload the next rotation accounts
@@ -109,21 +122,58 @@ class BrowserManager {
             "browser.shell.checkDefaultBrowser": false, // Skip default browser check
             "browser.tabs.warnOnClose": false, // No warning on closing tabs
             "datareporting.policy.dataSubmissionEnabled": false, // Disable data reporting
-            "dom.min_background_timeout_value": 1, // Disable background tab timer throttling (default: 1000ms)
-            "dom.min_timeout_value": 1, // Reduce global minimum timer interval (default: 4ms per HTML5 spec)
-            "dom.min_tracking_background_timeout_value": 1, // Disable tracking script background throttling (default: 10000ms)
-            "dom.timeout.background_budget_regeneration_rate": 200, // Increase budget regeneration rate to prevent budget exhaustion
-            "dom.timeout.background_throttling_max_budget": 100, // Increase max timer budget to reduce throttling frequency
-            "dom.timeout.budget_throttling_max_delay": 0, // Disable budget-based forced delay (default: 11250ms)
-            "dom.timeout.throttling_delay": 2147483647, // Prevent throttling from ever activating (default: 50ms)
-            "dom.webnotifications.enabled": false, // Disable notifications
-            "extensions.update.enabled": false, // Disable extension auto-update
-            "general.smoothScroll": false, // Disable smooth scrolling
-            "gfx.webrender.all": false, // Disable WebRender (GPU-based renderer)
-            "layers.acceleration.disabled": true, // Disable GPU hardware acceleration
-            "media.autoplay.default": 5, // 5 = Block all autoplay
-            "media.volume_scale": "0.0", // Mute audio
+            "dom.min_background_timeout_value": 1,
+            // Mute audio
+            // Additional anti-throttle prefs that the existing set
+            // didn't cover: disable budget-timer-throttling entirely and
+            // freeze-protection for worker tasks, so non-foreground
+            // contexts keep firing their fetch() tasks without delay.
+            "dom.min_background_timeout_value_without_budget_throttling": 4,
+
+            // Disable background tab timer throttling (default: 1000ms)
+            "dom.min_timeout_value": 1,
+            // Reduce global minimum timer interval (default: 4ms per HTML5 spec)
+            "dom.min_tracking_background_timeout_value": 1,
+
+            // Disable tracking script background throttling (default: 10000ms)
+            "dom.timeout.background_budget_regeneration_rate": 200,
+
+            // Increase budget regeneration rate to prevent budget exhaustion
+            "dom.timeout.background_throttling_max_budget": 100,
+            // Increase max timer budget to reduce throttling frequency
+            "dom.timeout.budget_throttling_max_delay": 0,
+
+            "dom.timeout.enable_budget_timer_throttling": false,
+
+            // Disable budget-based forced delay (default: 11250ms)
+            "dom.timeout.throttling_delay": 2147483647,
+
+            "dom.timeout.tracking_throttling_delay": 0,
+
+            // Prevent throttling from ever activating (default: 50ms)
+            "dom.webnotifications.enabled": false,
+
+            "dom.workers.throttling.enableWorkerTaskFreezing": false,
+
+            // Disable notifications
+            "extensions.update.enabled": false,
+
+            // Disable extension auto-update
+            "general.smoothScroll": false,
+
+            // Disable smooth scrolling
+            "gfx.webrender.all": false,
+
+            // Disable WebRender (GPU-based renderer)
+            "layers.acceleration.disabled": true,
+
+            // Disable GPU hardware acceleration
+            "media.autoplay.default": 5,
+            // 5 = Block all autoplay
+            "media.volume_scale": "0.0",
             "network.dns.disablePrefetch": true, // Disable DNS prefetching
+            "network.http.max-connections": 900, // Global max HTTP connections (default 900)
+            "network.http.max-persistent-connections-per-server": 64, // Per-host limit (default 6) - raised to avoid serializing concurrent fetches across parallel contexts
             "network.http.speculative-parallel-limit": 0, // Disable speculative connections
             "network.prefetch-next": false, // Disable link prefetching
             "permissions.default.geo": 0, // 0 = Always deny geolocation
@@ -283,23 +333,12 @@ class BrowserManager {
                 return;
             }
 
-            // Serialize storageState() on the same lock we use for newContext:
-            // it is also a browser-level call and racing multiple of them
-            // across parallel contexts hangs under Camoufox/Playwright Firefox.
-            const previousLock = this._contextCreationLock;
-            let releaseLock;
-            this._contextCreationLock = new Promise(resolve => {
-                releaseLock = resolve;
-            });
-            let storageState;
-            try {
-                await previousLock;
-                this.logger.debug(`[Auth Update] Reading storageState for #${authIndex}...`);
-                storageState = await contextData.context.storageState();
-                this.logger.debug(`[Auth Update] storageState for #${authIndex} read.`);
-            } finally {
-                releaseLock();
-            }
+            // Each account has its own Firefox now, so storageState() only
+            // races against that one browser's own state — no cross-account
+            // serialization needed.
+            this.logger.debug(`[Auth Update] Reading storageState for #${authIndex}...`);
+            const storageState = await contextData.context.storageState();
+            this.logger.debug(`[Auth Update] storageState for #${authIndex} read.`);
 
             // Merge new credentials into existing data
             authData.cookies = storageState.cookies;
@@ -416,6 +455,153 @@ class BrowserManager {
                 window._privacyProtectionInjected = true;
 
                 try {
+                    // 0. Always-visible page state. In Camoufox/Firefox with
+                    //    multiple parallel browser contexts, non-current pages
+                    //    observe document.visibilityState === 'hidden', which
+                    //    causes AI Studio's stream reader / rAF / timer loops
+                    //    to pause — stalling in-flight generations on rolled-
+                    //    off accounts during rapid usage-based switching.
+                    //    Force the page to report as visible at all times so
+                    //    the background drain path can actually complete.
+                    try {
+                        Object.defineProperty(Document.prototype, 'hidden', { configurable: true, get: () => false });
+                        Object.defineProperty(Document.prototype, 'visibilityState', { configurable: true, get: () => 'visible' });
+                        Object.defineProperty(Document.prototype, 'webkitHidden', { configurable: true, get: () => false });
+                        Object.defineProperty(Document.prototype, 'webkitVisibilityState', { configurable: true, get: () => 'visible' });
+                    } catch (_) {}
+                    // Suppress any visibilitychange events the runtime fires
+                    // before our override is installed. Listeners added AFTER
+                    // our override will see 'visible' via the property getter.
+                    try {
+                        const origAddEventListener = EventTarget.prototype.addEventListener;
+                        EventTarget.prototype.addEventListener = function(type, listener, options) {
+                            if (type === 'visibilitychange' || type === 'webkitvisibilitychange') {
+                                const wrapped = function(ev) {
+                                    try { return listener.call(this, ev); } catch (_) {}
+                                };
+                                return origAddEventListener.call(this, type, wrapped, options);
+                            }
+                            // Suppress blur events entirely — AI Studio's
+                            // Canvas app listens to window 'blur' to pause
+                            // its fetch dispatch pipeline when the tab
+                            // loses OS focus. Under multi-hot dispatch,
+                            // only one tab can be foreground; the rest
+                            // are effectively "blurred" forever and their
+                            // fetches stall. Swallowing the event keeps
+                            // AI Studio in its "focused" code path on
+                            // every pool context.
+                            if (type === 'blur' || type === 'webkitblur') {
+                                return origAddEventListener.call(this, type, function() {}, options);
+                            }
+                            return origAddEventListener.call(this, type, listener, options);
+                        };
+                    } catch (_) {}
+
+                    // Force document.hasFocus() to always return true so
+                    // any code path that gates on focus (including AI
+                    // Studio's Canvas app) treats the page as focused
+                    // regardless of which tab Firefox actually put in
+                    // the foreground. Paired with the blur-event
+                    // suppression above this keeps non-foreground pool
+                    // contexts in the "has focus" state.
+                    try {
+                        Document.prototype.hasFocus = function() { return true; };
+                    } catch (_) {}
+                    // Also shadow Window.prototype if any code calls
+                    // window.top.document.hasFocus via a parent ref.
+                    try {
+                        Object.defineProperty(window, 'onblur', { configurable: true, get: () => null, set: () => {} });
+                        Object.defineProperty(window, 'onfocus', { configurable: true, get: () => null, set: () => {} });
+                    } catch (_) {}
+
+                    // 0.5. Global fetch probe. The actual in-page client code is
+                    // currently served by the remote Canvas app, not the local
+                    // scripts/client/build.js source file. Instrument fetch at
+                    // the browser runtime boundary so we can observe whether
+                    // requests on rolled-off contexts actually start / finish.
+                    try {
+                        if (!window.__proxyFetchProbeInstalled) {
+                            window.__proxyFetchProbeInstalled = true;
+                            let fetchSeq = 0;
+                            const installFetchProbe = () => {
+                                if (typeof window.fetch !== 'function') return;
+                                if (window.fetch.__proxyFetchProbeWrapped) return;
+
+                                const currentFetch = window.fetch.bind(window);
+                                const wrappedFetch = async function(resource, init) {
+                                    const probeId = ++fetchSeq;
+                                    let url = '';
+                                    let method = 'GET';
+                                    try {
+                                        if (resource instanceof Request) {
+                                            url = resource.url || '';
+                                            method = resource.method || method;
+                                        } else {
+                                            url = String(resource || '');
+                                            method = (init && init.method) || method;
+                                        }
+                                    } catch (_) {}
+
+                                    const shouldLog =
+                                        typeof url === 'string' &&
+                                        (url.includes('generativelanguage.googleapis.com') ||
+                                            url.includes('alkalimakersuite-pa.clients6.google.com'));
+
+                                    if (shouldLog) {
+                                        console.log(
+                                            '[ProxyClient] [ProxyFetchProbe] START authIndex=${authIndex} probe=' +
+                                                probeId +
+                                                ' method=' +
+                                                method +
+                                                ' url=' +
+                                                url
+                                        );
+                                    }
+
+                                    try {
+                                        const response = await currentFetch(resource, init);
+                                        if (shouldLog) {
+                                            console.log(
+                                                '[ProxyClient] [ProxyFetchProbe] END authIndex=${authIndex} probe=' +
+                                                    probeId +
+                                                    ' status=' +
+                                                    response.status +
+                                                    ' ok=' +
+                                                    response.ok +
+                                                    ' url=' +
+                                                    url
+                                            );
+                                        }
+                                        return response;
+                                    } catch (err) {
+                                        if (shouldLog) {
+                                            const errName = err && err.name ? err.name : 'Error';
+                                            const errMsg = err && err.message ? err.message : String(err);
+                                            console.log(
+                                                '[ProxyClient] [ProxyFetchProbe] ERROR authIndex=${authIndex} probe=' +
+                                                    probeId +
+                                                    ' name=' +
+                                                    errName +
+                                                    ' message=' +
+                                                    errMsg +
+                                                    ' url=' +
+                                                    url
+                                            );
+                                        }
+                                        throw err;
+                                    }
+                                };
+
+                                wrappedFetch.__proxyFetchProbeWrapped = true;
+                                wrappedFetch.__proxyFetchProbeOriginal = currentFetch;
+                                window.fetch = wrappedFetch;
+                            };
+
+                            installFetchProbe();
+                            setInterval(installFetchProbe, 1000);
+                        }
+                    } catch (_) {}
+
                     // 1. Mask WebDriver property
                     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 
@@ -596,6 +782,187 @@ class BrowserManager {
     // }
 
     /**
+     * Deep-activate a pool context so it is in "launched" state before
+     * joining the dispatchable pool. Must be called from
+     * _initializeContext after WS init succeeds and before adding to
+     * the contexts map.
+     *
+     * Background: the original architecture only called
+     * _activateContext on the currently-active context, which is the
+     * only path that runs _startBackgroundWakeup — and _startBackground
+     * Wakeup is the only thing that physically clicks AI Studio's
+     * "Launch" button to transition the session past the welcome/
+     * rocket modal. Pre-loaded contexts that never became current
+     * stayed on the modal; when multi-hot dispatch later routes a
+     * request to them, the in-page fetch() never fires because the
+     * session isn't launched.
+     *
+     * This helper replicates just the Launch-click phase, using a
+     * pure page.evaluate() click (no page.mouse) so it does NOT need
+     * the tab to be foreground / have OS focus. That's the key to
+     * "bypass the blur block": instead of simulating a real user
+     * interaction that Firefox gates on focus, we dispatch a DOM
+     * click event directly from in-page JS, which fires regardless
+     * of visibility / hasFocus state.
+     *
+     * @param {import('playwright').Page} page
+     * @param {number} authIndex
+     * @returns {Promise<boolean>} true if a Launch button was clicked, false if polling exhausted without finding one
+     */
+    async _deepActivateContext(page, authIndex, options = {}) {
+        const logPrefix = options.logPrefix || `[Context#${authIndex}]`;
+        const totalTimeoutMs = options.totalTimeoutMs ?? 5000;
+        const pollIntervalMs = options.pollIntervalMs ?? 500;
+        const startedAt = Date.now();
+        this.logger.info(
+            `${logPrefix} 🚀 Deep activate: polling for Launch/rocket button (up to ${totalTimeoutMs}ms)...`
+        );
+
+        while (Date.now() - startedAt < totalTimeoutMs) {
+            if (page.isClosed?.()) {
+                this.logger.warn(`${logPrefix} Deep activate aborted: page closed.`);
+                return false;
+            }
+            if (this.abortedContexts.has(authIndex)) {
+                this.logger.info(`${logPrefix} Deep activate aborted: context marked for deletion.`);
+                return false;
+            }
+
+            let evalResult = null;
+            try {
+                evalResult = await page.evaluate(() => {
+                    // Scan the interaction modal area first (where the
+                    // rocket/Launch button typically lives), then fall
+                    // back to a broader scan across buttons/divs.
+                    const matches = /Launch|rocket_launch/i;
+                    const minY = 0;
+                    const maxY = 1200;
+
+                    const scanRoots = [
+                        // eslint-disable-next-line no-undef
+                        ...Array.from(document.querySelectorAll(".interaction-modal button, .interaction-modal p")),
+                        // eslint-disable-next-line no-undef
+                        ...Array.from(document.querySelectorAll('button, div[role="button"], span, a, i')),
+                    ];
+
+                    for (const el of scanRoots) {
+                        const text = (el.innerText || el.textContent || "").trim();
+                        if (!matches.test(text)) continue;
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width <= 0 || rect.height <= 0) continue;
+                        if (rect.top < minY || rect.top > maxY) continue;
+
+                        // Walk up to find a clickable ancestor (button
+                        // or role=button) — AI Studio wraps text in
+                        // spans / icons inside real buttons.
+                        let clickTarget = el;
+                        for (let depth = 0; depth < 3 && clickTarget.parentElement; depth++) {
+                            if (clickTarget.tagName === "BUTTON") break;
+                            if (clickTarget.getAttribute && clickTarget.getAttribute("role") === "button") break;
+                            clickTarget = clickTarget.parentElement;
+                        }
+
+                        try {
+                            // Pure DOM .click(): fires a synthetic
+                            // click event regardless of whether the
+                            // tab has OS focus or is blurred. This is
+                            // exactly what bypasses the blur gate.
+                            clickTarget.click();
+                            return {
+                                clicked: true,
+                                tag: clickTarget.tagName || "UNKNOWN",
+                                text: text.substring(0, 30),
+                            };
+                        } catch (e) {
+                            return { clicked: false, error: String(e) };
+                        }
+                    }
+                    return { clicked: false, notFound: true };
+                });
+            } catch (err) {
+                this.logger.debug(`${logPrefix} Deep activate evaluate failed: ${err.message}`);
+            }
+
+            if (evalResult && evalResult.clicked) {
+                const elapsedMs = Date.now() - startedAt;
+                this.logger.info(
+                    `${logPrefix} ✅ Deep activate: Launch clicked via JS (${evalResult.tag} "${evalResult.text}") after ${elapsedMs}ms`
+                );
+                // Small settle window so the modal transition finishes
+                // before the context joins the dispatch pool.
+                await page.waitForTimeout(1500).catch(() => {});
+                return true;
+            }
+
+            await page.waitForTimeout(pollIntervalMs).catch(() => {});
+        }
+
+        const elapsedMs = Date.now() - startedAt;
+        this.logger.warn(
+            `${logPrefix} ⚠️ Deep activate: no Launch button found after ${elapsedMs}ms — context may still need manual activation to work under multi-hot dispatch`
+        );
+        return false;
+    }
+
+    /**
+     * Count outstanding in-flight requests currently bound to a given auth
+     * index, by walking the shared ConnectionRegistry.messageQueues map.
+     * Used by the FastSwitch rate-limit + rolled-off monitor for DEBUG
+     * visibility into whether a just-rolled-off page is actually draining.
+     * @param {number} authIndex
+     * @returns {number}
+     */
+    _countPendingRequestsByAuth(authIndex) {
+        if (!this.connectionRegistry || !this.connectionRegistry.messageQueues) return 0;
+        let count = 0;
+        for (const entry of this.connectionRegistry.messageQueues.values()) {
+            if (entry && entry.authIndex === authIndex) count++;
+        }
+        return count;
+    }
+
+    /**
+     * DEBUG-only: after a FastSwitch rolls off a context, poll its
+     * pending-request count every ~2s for ~20s and log the delta, so we
+     * can see whether the rolled-off page is draining its in-flight
+     * fetches or sitting frozen. Overwrites any prior monitor for the
+     * same authIndex.
+     * @param {number} authIndex - The just-rolled-off authIndex
+     * @param {number} initialPending - Pending count captured pre-swap
+     */
+    _monitorRolledOffContext(authIndex, initialPending) {
+        const prior = this._rolledOffMonitors.get(authIndex);
+        if (prior) clearInterval(prior);
+
+        const startedAt = Date.now();
+        const durationMs = 20000;
+        const intervalMs = 2000;
+
+        this.logger.info(
+            `🔬 [RolledOff-DBG] Monitoring #${authIndex} for ${durationMs}ms (initial pending=${initialPending})`
+        );
+
+        const id = setInterval(() => {
+            const elapsed = Date.now() - startedAt;
+            const currentPending = this._countPendingRequestsByAuth(authIndex);
+            const isStillInPool = this.contexts.has(authIndex);
+            const isCurrent = this._currentAuthIndex === authIndex;
+            this.logger.info(
+                `🔬 [RolledOff-DBG] #${authIndex} t+${elapsed}ms pending=${currentPending} inPool=${isStillInPool} isCurrent=${isCurrent}`
+            );
+            if (elapsed >= durationMs || currentPending === 0 || !isStillInPool) {
+                clearInterval(id);
+                this._rolledOffMonitors.delete(authIndex);
+                this.logger.info(
+                    `🔬 [RolledOff-DBG] #${authIndex} monitor stopped (elapsed=${elapsed}ms, finalPending=${currentPending}, drained=${currentPending === 0})`
+                );
+            }
+        }, intervalMs);
+        id.unref?.();
+        this._rolledOffMonitors.set(authIndex, id);
+    }
+
+    /**
      * Activate a context as the current one: update legacy references, reset wakeup state,
      * and start background services (health monitor + wakeup + active trigger).
      * @param {object} ctx - The browser context object
@@ -607,9 +974,184 @@ class BrowserManager {
         this.page = pg;
         this._currentAuthIndex = authIndex;
         this.noButtonCount = 0;
+        // Tell Firefox to actually focus this tab so its JS runs at foreground
+        // priority. Without this, we only update Node-side routing state,
+        // and Firefox keeps the initial context as its sole foreground tab —
+        // resulting in later-activated contexts getting their JS task queue
+        // de-prioritized to the point where in-flight fetches stall.
+        // Safe here (unlike in _initializeContext) because _activateContext
+        // is only called sequentially on a single already-loaded page, not
+        // across multiple contexts in parallel.
+        pg.bringToFront().catch(err => {
+            this.logger.debug(`[Browser] bringToFront for #${authIndex} failed: ${err.message}`);
+        });
         this._startHealthMonitor();
         this._startBackgroundWakeup();
-        this._sendActiveTrigger("[Browser]", pg);
+        // EXPERIMENT: _sendActiveTrigger disabled during FastSwitch. It fires
+        // an extra `fetch('https://generativelanguage.googleapis.com/...')`
+        // from within the page, which is the same origin the user's request
+        // fetch is about to hit. Diagnostic monitor evidence shows that
+        // FastSwitch-activated contexts receive the WS request but their
+        // in-page fetch never resolves, while the initial-activated context
+        // #3 (whose trigger fired at boot when nothing else competed) drains
+        // normally. Hypothesis: the trigger fetch and user fetch land on the
+        // same HTTP/2 connection under Camoufox, where the trigger blocks.
+        // this._sendActiveTrigger("[Browser]", pg);
+    }
+
+    async _primeContextForDispatch(authIndex, page, options = {}) {
+        const contextData = this.contexts.get(authIndex);
+        if (!contextData || !page || page.isClosed?.()) return false;
+        if (contextData.dispatchReady === true) return true;
+
+        const logPrefix = options.logPrefix || `[DispatchPrime#${authIndex}]`;
+        const totalTimeoutMs = options.totalTimeoutMs ?? 2500;
+        const intervalMs = options.intervalMs ?? 350;
+        const startedAt = Date.now();
+
+        while (Date.now() - startedAt < totalTimeoutMs) {
+            if (page.isClosed?.()) return false;
+            await page.bringToFront().catch(() => {});
+            try {
+                const vp = page.viewportSize() || { height: 1080, width: 1920 };
+                const moveX = Math.floor(Math.random() * Math.max(100, vp.width * 0.4));
+                const moveY = Math.floor(Math.random() * Math.max(100, vp.height * 0.4));
+                await this._simulateHumanMovement(page, moveX, moveY);
+            } catch (err) {
+                this.logger.debug(`${logPrefix} human movement failed: ${err.message}`);
+            }
+
+            const handledLaunch = await this._attemptLaunchWakeup(page, logPrefix).catch(err => {
+                this.logger.debug(`${logPrefix} launch wake failed: ${err.message}`);
+                return false;
+            });
+            if (handledLaunch) {
+                contextData.dispatchReady = true;
+                this.logger.info(`${logPrefix} dispatch-ready via launch wakeup.`);
+                return true;
+            }
+
+            await page.waitForTimeout(intervalMs).catch(() => {});
+        }
+
+        return contextData.dispatchReady === true;
+    }
+
+    /**
+     * Ring-activate every loaded context in sequence so each page is
+     * individually brought to foreground for a short window. This is the
+     * workaround for the "pre-loaded-but-never-activated context stalls
+     * in-page fetch" bug: contexts that only went through _initializeContext
+     * (newContext + goto + WS init) but never through _activateContext keep
+     * Firefox's per-page task scheduler de-prioritized, so dispatched
+     * requests arrive over the WS but page.fetch() never fires on the wire.
+     *
+     * We cycle through every loaded context, call _activateContext on it,
+     * wait long enough for Firefox to actually process the focus change,
+     * then move on. The ring ENDS on `primaryIndex` so that after this
+     * method returns, that index is the current active context — matching
+     * what the caller in ProxyServerSystem expects from preloadContextPool.
+     *
+     * @param {number} primaryIndex - Which index should remain active at the end
+     * @param {string} logPrefix - Log prefix for status messages
+     */
+    async _ringActivateLoadedContexts(primaryIndex, logPrefix = "[RingActivate]") {
+        const loaded = [...this.contexts.entries()].filter(([, data]) => {
+            if (!data || !data.context || !data.page) return false;
+            try {
+                return !data.page.isClosed();
+            } catch {
+                return false;
+            }
+        });
+        if (loaded.length === 0) return;
+        if (loaded.length === 1) {
+            // Nothing to cycle; the single loaded context will be activated
+            // by the caller in the normal flow.
+            return;
+        }
+
+        // Put primaryIndex last so it ends as the active context. Everything
+        // else goes in Map iteration order (insertion order, which follows
+        // the startup sync-preload sequence).
+        const primary = loaded.find(([idx]) => idx === primaryIndex);
+        const others = loaded.filter(([idx]) => idx !== primaryIndex);
+        const ordered = primary ? [...others, primary] : loaded;
+
+        const activationDwellMs = 1200;
+        this.logger.info(
+            `${logPrefix} 🔄 Ring-activating ${ordered.length} loaded contexts sequentially ` +
+                `(dwell=${activationDwellMs}ms, order=[${ordered.map(([idx]) => idx).join(", ")}])...`
+        );
+
+        for (const [idx, data] of ordered) {
+            try {
+                if (!data.page || data.page.isClosed()) {
+                    this.logger.warn(`${logPrefix} Skipping #${idx}: page closed before activation`);
+                    continue;
+                }
+                this.logger.info(`${logPrefix} Activating context #${idx}...`);
+                this._activateContext(data.context, data.page, idx);
+                await this._primeContextForDispatch(idx, data.page, {
+                    intervalMs: 400,
+                    logPrefix: `${logPrefix} [Prime#${idx}]`,
+                    totalTimeoutMs: activationDwellMs,
+                }).catch(err => {
+                    this.logger.warn(`${logPrefix} Prime for #${idx} failed: ${err.message}`);
+                });
+                // Let Firefox's task scheduler actually process bringToFront
+                // and let the page's JS task queue drain at foreground priority
+                // before we steal focus again for the next context in the ring.
+                await data.page.waitForTimeout(activationDwellMs).catch(() => {});
+            } catch (err) {
+                this.logger.warn(`${logPrefix} Ring activation for #${idx} failed: ${err.message}`);
+            }
+        }
+
+        this.logger.info(`${logPrefix} ✅ Ring activation complete, primary=#${primaryIndex}`);
+    }
+
+    /**
+     * Before routing a request to a non-current account, give that page a
+     * short foreground wake-up window and one more Launch-button scan. In
+     * multi-browser mode this is the last missing step for accounts that were
+     * preloaded successfully but never became `currentAuthIndex`, so they
+     * received WS proxy requests without ever kicking off ProxyUnaryCall.
+     * Concurrent requests for the same authIndex share one wake-up promise.
+     * @param {number} authIndex
+     */
+    async prepareContextForDispatch(authIndex) {
+        if (!Number.isInteger(authIndex) || authIndex < 0) return;
+        if (authIndex === this._currentAuthIndex) return;
+
+        const existing = this._dispatchPrepTasks.get(authIndex);
+        if (existing) {
+            await existing;
+            return;
+        }
+
+        const prepTask = (async () => {
+            const contextData = this.contexts.get(authIndex);
+            const page = contextData?.page;
+            if (!page || page.isClosed?.()) return;
+            if (contextData.dispatchReady === true) return;
+
+            this.logger.info(`[DispatchPrep#${authIndex}] Waking non-current context before forwarding request...`);
+            await this._primeContextForDispatch(authIndex, page, {
+                intervalMs: 300,
+                logPrefix: `[DispatchPrep#${authIndex}]`,
+                totalTimeoutMs: 3000,
+            });
+        })();
+
+        this._dispatchPrepTasks.set(authIndex, prepTask);
+        try {
+            await prepTask;
+        } finally {
+            if (this._dispatchPrepTasks.get(authIndex) === prepTask) {
+                this._dispatchPrepTasks.delete(authIndex);
+            }
+        }
     }
 
     /**
@@ -1102,6 +1644,115 @@ class BrowserManager {
         }
     }
 
+    async _attemptLaunchWakeup(page, logPrefix = "[Browser]") {
+        const targetInfo = await page.evaluate(() => {
+            try {
+                const preciseCandidates = Array.from(
+                    // eslint-disable-next-line no-undef
+                    document.querySelectorAll(".interaction-modal p, .interaction-modal button")
+                );
+                for (const el of preciseCandidates) {
+                    if (/Launch|rocket_launch/i.test((el.innerText || "").trim())) {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            return {
+                                found: true,
+                                tagName: el.tagName,
+                                text: (el.innerText || "").trim().substring(0, 15),
+                                x: rect.left + rect.width / 2,
+                                y: rect.top + rect.height / 2,
+                            };
+                        }
+                    }
+                }
+            } catch (e) {
+                /* empty */
+            }
+
+            const MIN_Y = 400;
+            const MAX_Y = 800;
+            const isValid = rect => rect.width > 0 && rect.height > 0 && rect.top > MIN_Y && rect.top < MAX_Y;
+
+            // eslint-disable-next-line no-undef
+            const candidates = Array.from(document.querySelectorAll("button, span, div, a, i"));
+            for (const el of candidates) {
+                const text = (el.innerText || "").trim();
+                if (!/Launch|rocket_launch/i.test(text)) continue;
+
+                let targetEl = el;
+                let rect = targetEl.getBoundingClientRect();
+                let parentDepth = 0;
+                while (parentDepth < 3 && targetEl.parentElement) {
+                    if (targetEl.tagName === "BUTTON" || targetEl.getAttribute("role") === "button") break;
+                    const parent = targetEl.parentElement;
+                    const pRect = parent.getBoundingClientRect();
+                    if (isValid(pRect)) {
+                        targetEl = parent;
+                        rect = pRect;
+                    }
+                    parentDepth++;
+                }
+
+                if (isValid(rect)) {
+                    return {
+                        found: true,
+                        tagName: targetEl.tagName,
+                        text: text.substring(0, 15),
+                        x: rect.left + rect.width / 2,
+                        y: rect.top + rect.height / 2,
+                    };
+                }
+            }
+            return { found: false };
+        });
+
+        if (!targetInfo.found) {
+            return false;
+        }
+
+        this.logger.info(`${logPrefix} 🎯 Found Rocket/Launch button [${targetInfo.tagName}], engaging...`);
+        await page.mouse.move(targetInfo.x, targetInfo.y, { steps: 5 });
+        await new Promise(r => setTimeout(r, 300));
+        await page.mouse.down();
+        await new Promise(r => setTimeout(r, 400));
+        await page.mouse.up();
+
+        this.logger.info(`${logPrefix} 🖱️ Physical click executed. Verifying...`);
+        await new Promise(r => setTimeout(r, 1500));
+
+        const isStillThere = await page.evaluate(() => {
+            // eslint-disable-next-line no-undef
+            const els = Array.from(document.querySelectorAll('button, span, div[role="button"]'));
+            return els.some(el => {
+                const r = el.getBoundingClientRect();
+                return /Launch|rocket_launch/i.test(el.innerText) && r.top > 400 && r.top < 800 && r.height > 0;
+            });
+        });
+
+        if (isStillThere) {
+            this.logger.warn(`${logPrefix} ⚠️ Physical click ineffective, attempting JS force click...`);
+            await page.evaluate(() => {
+                const candidates = Array.from(
+                    // eslint-disable-next-line no-undef
+                    document.querySelectorAll('button, span, div[role="button"]')
+                );
+                for (const el of candidates) {
+                    const r = el.getBoundingClientRect();
+                    if (/Launch|rocket_launch/i.test(el.innerText) && r.top > 400 && r.top < 800) {
+                        (el.closest("button") || el).click();
+                        return true;
+                    }
+                }
+                return false;
+            });
+            await new Promise(r => setTimeout(r, 2000));
+        } else {
+            this.logger.info(`${logPrefix} ✅ Click successful, button disappeared.`);
+        }
+
+        return true;
+    }
+
     /**
      * Feature: Background Wakeup & "Launch" Button Handler
      * Specifically handles the "Rocket/Launch" button which blocks model loading.
@@ -1153,125 +1804,17 @@ class BrowserManager {
                 await this._simulateHumanMovement(currentPage, moveX, moveY);
 
                 // 2. Intelligent Scan for "Launch" or "Rocket" button
-                const targetInfo = await currentPage.evaluate(() => {
-                    // Optimized precise check
-                    try {
-                        const preciseCandidates = Array.from(
-                            // eslint-disable-next-line no-undef
-                            document.querySelectorAll(".interaction-modal p, .interaction-modal button")
-                        );
-                        for (const el of preciseCandidates) {
-                            if (/Launch|rocket_launch/i.test((el.innerText || "").trim())) {
-                                const rect = el.getBoundingClientRect();
-                                if (rect.width > 0 && rect.height > 0) {
-                                    return {
-                                        found: true,
-                                        tagName: el.tagName,
-                                        text: (el.innerText || "").trim().substring(0, 15),
-                                        x: rect.left + rect.width / 2,
-                                        y: rect.top + rect.height / 2,
-                                    };
-                                }
-                            }
-                        }
-                    } catch (e) {
-                        /* empty */
-                    }
-
-                    const MIN_Y = 400;
-                    const MAX_Y = 800;
-
-                    const isValid = rect => rect.width > 0 && rect.height > 0 && rect.top > MIN_Y && rect.top < MAX_Y;
-
-                    // eslint-disable-next-line no-undef
-                    const candidates = Array.from(document.querySelectorAll("button, span, div, a, i"));
-
-                    for (const el of candidates) {
-                        const text = (el.innerText || "").trim();
-                        // Match "Launch" or material icon "rocket_launch"
-                        if (!/Launch|rocket_launch/i.test(text)) continue;
-
-                        let targetEl = el;
-                        let rect = targetEl.getBoundingClientRect();
-
-                        // Recursive parent check (up to 3 levels)
-                        let parentDepth = 0;
-                        while (parentDepth < 3 && targetEl.parentElement) {
-                            if (targetEl.tagName === "BUTTON" || targetEl.getAttribute("role") === "button") break;
-                            const parent = targetEl.parentElement;
-                            const pRect = parent.getBoundingClientRect();
-                            if (isValid(pRect)) {
-                                targetEl = parent;
-                                rect = pRect;
-                            }
-                            parentDepth++;
-                        }
-
-                        if (isValid(rect)) {
-                            return {
-                                found: true,
-                                tagName: targetEl.tagName,
-                                text: text.substring(0, 15),
-                                x: rect.left + rect.width / 2,
-                                y: rect.top + rect.height / 2,
-                            };
-                        }
-                    }
-                    return { found: false };
-                });
+                const handledLaunch = await this._attemptLaunchWakeup(currentPage, "[Browser]");
 
                 // 3. Execute Click if found
-                if (targetInfo.found) {
-                    this.logger.info(`[Browser] 🎯 Found Rocket/Launch button [${targetInfo.tagName}], engaging...`);
-
-                    // Physical Click
-                    await currentPage.mouse.move(targetInfo.x, targetInfo.y, { steps: 5 });
-                    await new Promise(r => setTimeout(r, 300));
-                    await currentPage.mouse.down();
-                    await new Promise(r => setTimeout(r, 400));
-                    await currentPage.mouse.up();
-
-                    this.logger.info(`[Browser] 🖱️ Physical click executed. Verifying...`);
-                    await new Promise(r => setTimeout(r, 1500));
-
-                    // Strategy B: JS Click (Fallback)
-                    const isStillThere = await currentPage.evaluate(() => {
-                        // eslint-disable-next-line no-undef
-                        const els = Array.from(document.querySelectorAll('button, span, div[role="button"]'));
-                        return els.some(el => {
-                            const r = el.getBoundingClientRect();
-                            return (
-                                /Launch|rocket_launch/i.test(el.innerText) && r.top > 400 && r.top < 800 && r.height > 0
-                            );
-                        });
-                    });
-
-                    if (isStillThere) {
-                        this.logger.warn(`[Browser] ⚠️ Physical click ineffective, attempting JS force click...`);
-                        await currentPage.evaluate(() => {
-                            const candidates = Array.from(
-                                // eslint-disable-next-line no-undef
-                                document.querySelectorAll('button, span, div[role="button"]')
-                            );
-                            for (const el of candidates) {
-                                const r = el.getBoundingClientRect();
-                                if (/Launch|rocket_launch/i.test(el.innerText) && r.top > 400 && r.top < 800) {
-                                    (el.closest("button") || el).click();
-                                    return true;
-                                }
-                            }
-                        });
-                        await new Promise(r => setTimeout(r, 2000));
-                    } else {
-                        this.logger.info(`[Browser] ✅ Click successful, button disappeared.`);
-                        // Long sleep on success, but check for context switches every second
-                        for (let i = 0; i < 60; i++) {
-                            if (this.noButtonCount === 0) {
-                                this.logger.info(`[Browser] ⚡ Woken up early due to user activity or context switch.`);
-                                break; // Wake up early if user activity detected
-                            }
-                            await new Promise(r => setTimeout(r, 1000));
+                if (handledLaunch) {
+                    // Long sleep on success, but check for context switches every second
+                    for (let i = 0; i < 60; i++) {
+                        if (this.noButtonCount === 0) {
+                            this.logger.info(`[Browser] ⚡ Woken up early due to user activity or context switch.`);
+                            break; // Wake up early if user activity detected
                         }
+                        await new Promise(r => setTimeout(r, 1000));
                     }
                 } else {
                     this.noButtonCount++;
@@ -1313,7 +1856,12 @@ class BrowserManager {
      * @returns {Promise<{firstReady: number|null}>}
      */
     async preloadContextPool(startupOrder, maxContexts) {
-        const poolSize = maxContexts === 0 ? startupOrder.length : Math.min(maxContexts, startupOrder.length);
+        // Inflate the target pool by rollingPreloadCount so the startup
+        // background preload already warms up the "next-rotation" standby
+        // slot that rebalanceContextPool will also maintain at runtime.
+        const rollingPreload = Math.max(0, this.config.rollingPreloadCount ?? 0);
+        const effectiveMax = maxContexts === 0 ? 0 : maxContexts + rollingPreload;
+        const poolSize = effectiveMax === 0 ? startupOrder.length : Math.min(effectiveMax, startupOrder.length);
         // How many contexts to bring up synchronously before the system starts
         // accepting traffic. Defaults to the full pool so the user doesn't have
         // to rely on the background preload to eventually catch up.
@@ -1331,10 +1879,9 @@ class BrowserManager {
         // Abort any existing background preload/rebalance to ensure clean state
         await this.abortBackgroundPreload();
 
-        // Launch browser if not already running
-        if (!this.browser) {
-            await this._ensureBrowser();
-        }
+        // Per-account Firefox processes are launched lazily by
+        // _initializeContext → _ensureBrowserFor(authIndex). No upfront
+        // shared-browser launch is needed here.
 
         // Init accounts in parallel batches until we either hit the sync target
         // or exhaust the startup order. `firstReady` tracks the first successful
@@ -1394,9 +1941,16 @@ class BrowserManager {
         }
 
         if (firstReady === null) {
-            if (this.browser) await this.closeBrowser();
+            if (this.browsers.size > 0) await this.closeBrowser();
             return { firstReady: null };
         }
+
+        // Ring-activate every sync-loaded context so each page is individually
+        // brought to foreground once. Fixes the "preloaded-but-never-activated
+        // context stalls in-page fetch" bug — see _ringActivateLoadedContexts
+        // docstring. Ends on `firstReady` so the normal activation path that
+        // runs right after preloadContextPool is already aligned.
+        await this._ringActivateLoadedContexts(firstReady, "[ContextPool]");
 
         // Early return if pool size is 1 (single context mode) - no need for background preload
         if (poolSize === 1) {
@@ -1449,39 +2003,71 @@ class BrowserManager {
     /**
      * Launch browser instance if not already running
      */
-    async _ensureBrowser() {
-        if (this.browser) return;
+    /**
+     * Launch (or return the already-launched) dedicated Firefox instance for
+     * one specific account. Each account gets its own main Firefox process so
+     * that its page is the primary tab of its own browser — sidestepping the
+     * single-process scheduler hold on non-primary tab fetches we hit under
+     * a shared browser.
+     *
+     * @param {number} authIndex - which account this browser belongs to
+     * @returns {Promise<import('playwright').Browser>}
+     */
+    async _ensureBrowserFor(authIndex) {
+        const existing = this.browsers.get(authIndex);
+        if (existing) return existing;
 
         const proxyConfig = parseProxyFromEnv();
-        this.logger.info("🚀 [Browser] Launching main browser instance (Camoufox/Firefox)...");
-        // camoufox-js manages its own Camoufox binary under ~/.cache/camoufox/.
-        // It is downloaded on-demand via `npx camoufox-js fetch` during deploy.
-        // Do NOT pass executable_path pointing at a manually-bundled .app bundle —
-        // camoufox-js expects properties.json next to the binary, which differs
-        // from Apple's .app layout.
+        this.logger.info(`🚀 [Browser#${authIndex}] Launching dedicated Firefox instance...`);
         const camouOpts = await _getCamoufoxLaunchOptions({
             args: this.launchArgs,
             firefox_user_prefs: this.firefoxUserPrefs,
             geoip: true,
             headless: true,
-            humanize: true,
+            humanize: false,
             i_know_what_im_doing: true,
             ...(this.browserExecutablePath ? { executable_path: this.browserExecutablePath } : {}),
         });
-        this.browser = await firefox.launch({
+        const browser = await firefox.launch({
             ...camouOpts,
             ...(proxyConfig ? { proxy: proxyConfig } : {}),
         });
-        this.browser.on("disconnected", () => {
+        browser.on("disconnected", () => {
+            this.browsers.delete(authIndex);
             if (!this.isClosingIntentionally) {
-                this.logger.error("❌ [Browser] Main browser unexpectedly disconnected!");
+                this.logger.error(`❌ [Browser#${authIndex}] Firefox unexpectedly disconnected!`);
+                // Scrub just this account's context rather than wiping the pool —
+                // the other accounts have their own Firefox processes and are
+                // unaffected.
+                this._cleanupSingleContext(authIndex);
             } else {
-                this.logger.debug("[Browser] Main browser closed intentionally.");
+                this.logger.debug(`[Browser#${authIndex}] Firefox closed intentionally.`);
             }
-            this.browser = null;
-            this._cleanupAllContexts();
         });
-        this.logger.info(`✅ [Browser] Main browser instance launched successfully (${this.browser.version()}).`);
+        this.browsers.set(authIndex, browser);
+        this.logger.info(`✅ [Browser#${authIndex}] Firefox launched (${browser.version()}).`);
+        return browser;
+    }
+
+    /**
+     * Cleanup resources for a single auth index without touching other
+     * contexts or their per-account browsers.
+     */
+    _cleanupSingleContext(authIndex) {
+        const contextData = this.contexts.get(authIndex);
+        if (contextData?.healthMonitorInterval) {
+            clearInterval(contextData.healthMonitorInterval);
+            contextData.healthMonitorInterval = null;
+        }
+        this.contexts.delete(authIndex);
+        this.initializingContexts.delete(authIndex);
+        this.abortedContexts.delete(authIndex);
+        this._wsInitState.delete(authIndex);
+        if (this._currentAuthIndex === authIndex) {
+            this.context = null;
+            this.page = null;
+            this._currentAuthIndex = -1;
+        }
     }
 
     /**
@@ -1491,11 +2077,13 @@ class BrowserManager {
      */
     async abortBackgroundPreload() {
         if (!this._backgroundPreloadTask) {
+            this._pendingBackgroundPreloadRequest = null;
             return; // No task to abort
         }
 
         this.logger.info(`[ContextPool] Aborting background preload task...`);
         this._backgroundPreloadAbort = true;
+        this._pendingBackgroundPreloadRequest = null;
 
         try {
             await this._backgroundPreloadTask;
@@ -1509,17 +2097,43 @@ class BrowserManager {
 
     /**
      * Background sequential initialization of contexts (fire-and-forget)
-     * Only one instance should be active at a time - new calls abort old ones
+     * Only one instance should be active at a time. New calls are coalesced
+     * into a follow-up request instead of aborting the in-flight task, because
+     * repeated rebalance ticks can otherwise keep killing half-finished
+     * browser launches before the replacement account ever reaches the pool.
      * @param {number[]} indices - Auth indices to initialize (candidates, may exceed pool size)
      * @param {number} maxPoolSize - Stop when this.contexts.size reaches this limit (0 = no limit)
      */
     async _preloadBackgroundContexts(indices, maxPoolSize = 0) {
-        // If there's an existing background task, abort it and wait for it to finish
-        await this.abortBackgroundPreload();
+        const normalizedIndices = [...new Set(indices)].filter(
+            authIndex => !this.contexts.has(authIndex) && !this.initializingContexts.has(authIndex)
+        );
+        if (normalizedIndices.length === 0) {
+            return;
+        }
+
+        if (this._backgroundPreloadTask) {
+            const existing = this._pendingBackgroundPreloadRequest;
+            const mergedIndices = [...new Set([...(existing?.indices || []), ...normalizedIndices])];
+            const mergedMaxPoolSize =
+                existing && existing.maxPoolSize === 0
+                    ? 0
+                    : maxPoolSize === 0
+                      ? 0
+                      : Math.max(existing?.maxPoolSize || 0, maxPoolSize);
+            this._pendingBackgroundPreloadRequest = {
+                indices: mergedIndices,
+                maxPoolSize: mergedMaxPoolSize,
+            };
+            this.logger.info(
+                `[ContextPool] Background preload already running, queued follow-up preload for [${mergedIndices.join(", ")}] (poolCap=${mergedMaxPoolSize || "unlimited"}).`
+            );
+            return;
+        }
 
         // Reset abort flag and create new background task
         this._backgroundPreloadAbort = false;
-        const currentTask = this._executePreloadTask(indices, maxPoolSize);
+        const currentTask = this._executePreloadTask(normalizedIndices, maxPoolSize);
         this._backgroundPreloadTask = currentTask;
 
         // Don't await here - this is fire-and-forget
@@ -1532,6 +2146,14 @@ class BrowserManager {
                 // Only clear if this is still the current task
                 if (this._backgroundPreloadTask === currentTask) {
                     this._backgroundPreloadTask = null;
+                }
+
+                const pending = this._pendingBackgroundPreloadRequest;
+                this._pendingBackgroundPreloadRequest = null;
+                if (pending) {
+                    this._preloadBackgroundContexts(pending.indices, pending.maxPoolSize).catch(error => {
+                        this.logger.error(`[ContextPool] Queued background preload task failed: ${error.message}`);
+                    });
                 }
             });
     }
@@ -1557,19 +2179,8 @@ class BrowserManager {
                 break;
             }
 
-            // Check if browser is available, launch if needed
-            if (!this.browser) {
-                this.logger.info(`[ContextPool] Browser not available, launching browser for background preload...`);
-                try {
-                    await this._ensureBrowser();
-                    this.logger.info(`[ContextPool] Browser launched successfully for background preload`);
-                } catch (error) {
-                    this.logger.error(
-                        `[ContextPool] Failed to launch browser for background preload: ${error.message}`
-                    );
-                    break;
-                }
-            }
+            // Per-account Firefox processes are launched lazily by
+            // _initializeContext → _ensureBrowserFor. Nothing to do upfront.
 
             // Check pool size limit — bail out if we've reached it.
             if (maxPoolSize > 0 && this.contexts.size >= maxPoolSize) {
@@ -1830,6 +2441,14 @@ class BrowserManager {
         const maxContexts = this.config.maxContexts;
         // maxContexts === 0 means unlimited pool size
         const isUnlimited = maxContexts === 0;
+        const rollingPreload = Math.max(0, this.config.rollingPreloadCount ?? 0);
+        // Effective pool cap = dispatchable hot contexts + rolling pre-warm
+        // standby slots. The extra slot(s) give the next-rotation candidate
+        // a chance to be fully initialized BEFORE usage-based rotation
+        // actually needs it, eliminating the cold-start tail where the
+        // last batch of a burst hits an account that has to init from
+        // scratch.
+        const effectiveMax = isUnlimited ? 0 : maxContexts + rollingPreload;
 
         // Build full rotation ordered from current account
         const rotation = this.authSource.getRotationIndices();
@@ -1841,40 +2460,119 @@ class BrowserManager {
             ordered.push(rotation[(startPos + i) % rotation.length]);
         }
 
-        // Targets = first maxContexts from ordered (or all available if unlimited)
-        // In unlimited mode, include all valid accounts (rotation + duplicates), excluding expired
+        // Targets = first effectiveMax from ordered (or all available if unlimited).
+        // In unlimited mode, include all valid accounts (rotation + duplicates), excluding expired.
         let targets;
         if (isUnlimited) {
             // Filter out expired accounts from availableIndices
             const nonExpiredAvailable = this.authSource.availableIndices.filter(idx => !this.authSource.isExpired(idx));
             targets = new Set(nonExpiredAvailable);
         } else {
-            targets = new Set(ordered.slice(0, maxContexts));
+            targets = new Set(ordered.slice(0, effectiveMax));
         }
 
-        // NEW POLICY: Rebalance is additive only. It never evicts existing
-        // contexts — the user has explicit control over closure via the
-        // WebUI "Close session" button. This removes the historical
-        // surprise where switching accounts would silently drop unrelated
-        // loaded contexts. Duplicate-account cleanup also happens only
-        // when the user explicitly asks.
+        // ROLLING REPLACEMENT: Close loaded contexts that have fallen out of
+        // the current rotation window AND have no in-flight requests. This
+        // keeps the pool rolling forward as the rotation cursor advances,
+        // instead of letting old accounts accumulate indefinitely. Safety
+        // guards:
+        //   • never retire the currently-active account (UI / routing anchor)
+        //   • never retire a context with pending work (in-flight > 0)
+        //   • never retire a context still being initialized
+        const registry = this.connectionRegistry;
+        const retireEligible = [];
+        for (const idx of [...this.contexts.keys()]) {
+            const canonical = this.authSource.getCanonicalIndex(idx) ?? idx;
+            if (targets.has(canonical)) continue;
+            if (idx === this._currentAuthIndex) continue;
+            if (this.initializingContexts.has(idx)) continue;
+            const inflight =
+                registry && typeof registry.getInflightCountForAuth === "function"
+                    ? registry.getInflightCountForAuth(idx)
+                    : 0;
+            if (inflight > 0) {
+                this.logger.debug(`[ContextPool] Rebalance retire skipped: #${idx} still has ${inflight} in-flight`);
+                continue;
+            }
+            retireEligible.push(idx);
+        }
 
-        // Candidates: accounts in rotation order that are not yet present.
+        // Cap actual retire count so post-retire loaded pool never drops
+        // below effectiveMax. Retiring a stale context BEFORE its
+        // replacement has finished initializing would shrink dispatch
+        // parallelism during the burst that's currently hitting the
+        // remaining pool. Anything beyond the cap is deferred — it will
+        // be picked up on the next rebalance tick (fired either when a
+        // new preload completes or via the stalled-rebalance timer).
+        const loadedCount = this.contexts.size;
+        const maxRetireAllowed = isUnlimited ? retireEligible.length : Math.max(0, loadedCount - effectiveMax);
+        const retireCandidates = retireEligible.slice(0, maxRetireAllowed);
+        const deferredRetireDueToSize = retireEligible.slice(maxRetireAllowed);
+
         // Convert active contexts to canonical indices so duplicates collapse.
         const activeCanonical = new Set(
             [...this.contexts.keys(), ...this.initializingContexts].map(
                 idx => this.authSource.getCanonicalIndex(idx) ?? idx
             )
         );
-        const candidates = ordered.filter(idx => !activeCanonical.has(idx));
+
+        // Missing targets: target rotation entries that are NOT already
+        // loaded or being initialized. These must be preloaded even if
+        // the pool currently sits at effectiveMax, because some of the
+        // loaded contexts may be stale (outside the target window) and
+        // stuck waiting for in-flight work to drain before they can be
+        // retired. If we gated preload on "pool has free slot" those
+        // missing target entries would never get pre-warmed under
+        // sustained load, breaking rolling replacement.
+        const missingTargets = isUnlimited
+            ? ordered.filter(idx => !activeCanonical.has(idx))
+            : [...targets].filter(idx => !activeCanonical.has(idx));
+
+        // Stalled retirements: contexts outside the target window that
+        // still have in-flight work. We'll schedule another rebalance
+        // shortly to pick them up once their queues drain.
+        const stalledRetirements = [];
+        for (const idx of [...this.contexts.keys()]) {
+            const canonical = this.authSource.getCanonicalIndex(idx) ?? idx;
+            if (targets.has(canonical)) continue;
+            if (idx === this._currentAuthIndex) continue;
+            if (this.initializingContexts.has(idx)) continue;
+            if (retireCandidates.includes(idx)) continue;
+            stalledRetirements.push(idx);
+        }
 
         this.logger.info(
-            `[ContextPool] Rebalance (additive only): targets=[${[...targets]}], currentPool=[${[...this.contexts.keys()]}], candidates=[${candidates}]`
+            `[ContextPool] Rebalance: targets=[${[...targets]}], effectiveMax=${isUnlimited ? "∞" : effectiveMax}, currentPool=[${[...this.contexts.keys()]}], missing=[${missingTargets}], retire=[${retireCandidates}], deferredBySize=[${deferredRetireDueToSize}], stalled=[${stalledRetirements}]`
         );
 
-        // Preload candidates only if we still have room.
-        if (candidates.length > 0 && (isUnlimited || this.contexts.size < maxContexts)) {
-            this._preloadBackgroundContexts(candidates, isUnlimited ? 0 : maxContexts);
+        // Fire retirements in parallel, non-blocking. closeContext is
+        // graceful-safe for 0-inflight contexts so this is cheap.
+        for (const idx of retireCandidates) {
+            this.closeContext(idx, { graceful: false }).catch(err => {
+                this.logger.warn(`[ContextPool] Rebalance retire close failed for #${idx}: ${err.message}`);
+            });
+        }
+
+        // Preload missing target entries. Pass 0 (no cap) because we
+        // already filtered to exactly the target-window-minus-loaded
+        // set, so the number of inits is bounded. This lets rolling
+        // preload proceed even when stale contexts still hold slots.
+        if (missingTargets.length > 0) {
+            this._preloadBackgroundContexts(missingTargets, 0);
+        }
+
+        // If any contexts were stuck waiting for in-flight drain,
+        // re-run rebalance shortly so they get retired once their
+        // work finishes. Debounced to avoid stacking timers.
+        if (stalledRetirements.length > 0) {
+            if (this._stalledRebalanceTimer) clearTimeout(this._stalledRebalanceTimer);
+            this._stalledRebalanceTimer = setTimeout(() => {
+                this._stalledRebalanceTimer = null;
+                this.rebalanceContextPool().catch(err => {
+                    this.logger.warn(`[ContextPool] Stalled rebalance retry failed: ${err.message}`);
+                });
+            }, 3000);
+            this._stalledRebalanceTimer.unref?.();
         }
     }
 
@@ -1935,45 +2633,71 @@ class BrowserManager {
                 throw new ContextAbortedError(authIndex, "marked for deletion");
             }
 
-            // Serialize the browser-level setup across parallel invocations.
-            // Chain onto the existing lock and replace it with our own promise
-            // so the next caller waits for us. Using a single shared chain
-            // keeps ordering deterministic and avoids the observed deadlock
-            // in Camoufox where concurrent newContext/newPage across multiple
-            // auth indices caused all but the last invocation to hang before
-            // the init script could ever run.
-            const previousLock = this._contextCreationLock;
-            let releaseLock;
-            this._contextCreationLock = new Promise(resolve => {
-                releaseLock = resolve;
-            });
-            try {
-                await previousLock;
+            // Launch a dedicated Firefox process for this account (or reuse the
+            // existing one if it was already launched). Each browser sees only
+            // its own single newContext/newPage call, so the Camoufox
+            // concurrent-newContext deadlock that used to require shared-lock
+            // serialization is no longer reachable — every browser is its own
+            // serialization domain.
+            const accountBrowser = await this._ensureBrowserFor(authIndex);
 
-                this.logger.debug(`[Context#${authIndex}] Creating browser context...`);
-                context = await this.browser.newContext({
-                    deviceScaleFactor: 1,
-                    storageState: storageStateObject,
-                    viewport: { height: randomHeight, width: randomWidth },
-                    ...(proxyConfig ? { proxy: proxyConfig } : {}),
-                });
-                this.logger.debug(`[Context#${authIndex}] Context created, injecting privacy script...`);
-
-                // Check abort status after context creation
-                if (this.abortedContexts.has(authIndex) || (isBackgroundTask && this._backgroundPreloadAbort)) {
-                    throw new ContextAbortedError(authIndex, "marked for deletion");
-                }
-
-                // Inject Privacy Script immediately after context creation
-                const privacyScript = this._getPrivacyProtectionScript(authIndex);
-                await context.addInitScript(privacyScript);
-                this.logger.debug(`[Context#${authIndex}] Init script injected, opening page...`);
-
-                page = await context.newPage();
-                this.logger.debug(`[Context#${authIndex}] Page opened, releasing creation lock.`);
-            } finally {
-                releaseLock();
+            // Check abort status after launch
+            if (this.abortedContexts.has(authIndex) || (isBackgroundTask && this._backgroundPreloadAbort)) {
+                throw new ContextAbortedError(authIndex, "marked for deletion");
             }
+
+            this.logger.debug(`[Context#${authIndex}] Creating browser context...`);
+            context = await accountBrowser.newContext({
+                deviceScaleFactor: 1,
+                storageState: storageStateObject,
+                viewport: { height: randomHeight, width: randomWidth },
+                ...(proxyConfig ? { proxy: proxyConfig } : {}),
+            });
+            this.logger.debug(`[Context#${authIndex}] Context created, injecting privacy script...`);
+
+            // Check abort status after context creation
+            if (this.abortedContexts.has(authIndex) || (isBackgroundTask && this._backgroundPreloadAbort)) {
+                throw new ContextAbortedError(authIndex, "marked for deletion");
+            }
+
+            // Inject Privacy Script immediately after context creation
+            const privacyScript = this._getPrivacyProtectionScript(authIndex);
+            await context.addInitScript(privacyScript);
+            this.logger.debug(`[Context#${authIndex}] Init script injected, opening page...`);
+
+            page = await context.newPage();
+            this.logger.debug(`[Context#${authIndex}] Page opened.`);
+
+            const shouldProbeNetwork = url =>
+                typeof url === "string" &&
+                (url.includes("generativelanguage.googleapis.com") ||
+                    url.includes("alkalimakersuite-pa.clients6.google.com"));
+
+            page.on("request", request => {
+                const url = request.url();
+                if (!shouldProbeNetwork(url)) return;
+                if (url.includes("MakerSuiteService/ProxyUnaryCall") && this.connectionRegistry) {
+                    this.connectionRegistry.markNextUnissuedRequestForAuthIssued(authIndex);
+                    const ctx = this.contexts.get(authIndex);
+                    if (ctx) ctx.dispatchReady = true;
+                }
+                this.logger.info(`[NetProbe#${authIndex}] REQUEST ${request.method()} ${url}`);
+            });
+
+            page.on("response", response => {
+                const url = response.url();
+                if (!shouldProbeNetwork(url)) return;
+                this.logger.info(
+                    `[NetProbe#${authIndex}] RESPONSE ${response.status()} ${response.request().method()} ${url}`
+                );
+            });
+
+            page.on("requestfailed", request => {
+                const url = request.url();
+                if (!shouldProbeNetwork(url)) return;
+                const failureText = request.failure()?.errorText || "unknown";
+                this.logger.info(`[NetProbe#${authIndex}] FAILED ${request.method()} ${url} error=${failureText}`);
+            });
 
             // NOTE: Removed bringToFront/window.focus/humanMovement wakeup step.
             // In headless Camoufox it has no effect, and under parallel batch
@@ -2076,6 +2800,18 @@ class BrowserManager {
                 }
             }
 
+            // DEEP ACTIVATE: every pool context must be "launched" before
+            // it can process in-page fetches under multi-hot dispatch.
+            // Pre-loaded contexts that never became current via a
+            // FastSwitch do NOT have their AI Studio Launch button
+            // clicked, so their session stays on the welcome / rocket
+            // modal — the in-page script receives WS messages fine
+            // but its fetch() never hits the wire. This helper polls
+            // for the Launch button via page.evaluate and clicks it
+            // synthetically (no focus required), so every context
+            // enters the pool in a launched-and-ready state.
+            await this._deepActivateContext(page, authIndex);
+
             // Final check before adding to contexts map
             if (this.abortedContexts.has(authIndex) || (isBackgroundTask && this._backgroundPreloadAbort)) {
                 throw new ContextAbortedError(authIndex, "marked for deletion");
@@ -2084,11 +2820,33 @@ class BrowserManager {
             // Save to contexts map - with atomic abort check to prevent race condition
             // between the check above and actually adding to the map
             if (!this.abortedContexts.has(authIndex) && !(isBackgroundTask && this._backgroundPreloadAbort)) {
+                // Lightweight keep-alive ping loop. Preloaded contexts that
+                // are NEVER activated (sitting idle in the pool) fall into
+                // a deeply-throttled state where fetch() dispatched via WS
+                // later gets stalled for tens of seconds. Calling a trivial
+                // page.evaluate every 500ms keeps the page's JS task queue
+                // active and makes subsequent WS-triggered fetches respond
+                // promptly. Cleared in closeContext.
+                const keepAliveInterval = setInterval(() => {
+                    if (page.isClosed?.()) return;
+                    page.evaluate(() => 1).catch(() => {});
+                }, 500);
+                keepAliveInterval.unref?.();
+
                 this.contexts.set(authIndex, {
                     context,
+                    dispatchReady: false,
                     healthMonitorInterval: null,
+                    keepAliveInterval,
                     page,
                 });
+                // NOTE: we intentionally do NOT fire a rebalance here.
+                // The startup `preloadContextPool` loop and the runtime
+                // `_preloadBackgroundContexts` path both add contexts
+                // this way; a rebalance-on-init hook would race with
+                // them. Deferred-size retirements are re-swept by the
+                // stalled-rebalance timer scheduled at the bottom of
+                // rebalanceContextPool instead.
             } else {
                 throw new ContextAbortedError(authIndex, "marked for deletion");
             }
@@ -2125,6 +2883,15 @@ class BrowserManager {
                 this.logger.info(`[Browser] Removed failed context #${authIndex} from contexts map`);
             }
 
+            // Close the per-account Firefox that we launched for this index.
+            // There's no point keeping a dedicated Firefox around for a
+            // context that failed to initialize.
+            const failedBrowser = this.browsers.get(authIndex);
+            if (failedBrowser) {
+                this.browsers.delete(authIndex);
+                failedBrowser.close().catch(() => {});
+            }
+
             // Close context if it was created
             if (context) {
                 try {
@@ -2153,13 +2920,21 @@ class BrowserManager {
             throw new Error(`Invalid authIndex: ${authIndex}. Must be >= 0.`);
         }
 
-        // [Auth Switch] Save current auth data before switching
-        if (this.browser && this._currentAuthIndex >= 0 && this._currentAuthIndex !== authIndex) {
-            try {
-                await this._updateAuthFile(this._currentAuthIndex);
-            } catch (e) {
-                this.logger.warn(`[Browser] Failed to save current auth during switch: ${e.message}`);
-            }
+        // [Auth Switch] Fire-and-forget: save current auth data in the
+        // background so rapid usage-based switches don't block on storageState
+        // (which is serialized via _contextCreationLock). Queueing the auth
+        // save behind the lock during a FastSwitch burst held up the rest of
+        // the rolling window and starved in-flight requests on the rolling-off
+        // contexts long enough that their graceful drain timed out.
+        if (
+            this._currentAuthIndex >= 0 &&
+            this._currentAuthIndex !== authIndex &&
+            this.contexts.has(this._currentAuthIndex)
+        ) {
+            const idxToSave = this._currentAuthIndex;
+            this._updateAuthFile(idxToSave).catch(e => {
+                this.logger.warn(`[Browser] Background auth save for #${idxToSave} failed: ${e.message}`);
+            });
         }
 
         // Wait for background initialization if in progress
@@ -2168,10 +2943,8 @@ class BrowserManager {
             await this._waitForContextInit(authIndex);
         }
 
-        // Check if browser is running, launch if needed
-        if (!this.browser) {
-            await this._ensureBrowser();
-        }
+        // Per-account Firefox launch happens lazily inside _initializeContext
+        // via _ensureBrowserFor(authIndex). No upfront shared-browser check.
 
         // Check if context already exists (fast switch path)
         if (this.contexts.has(authIndex)) {
@@ -2230,8 +3003,23 @@ class BrowserManager {
                             }
                         }
 
+                        // === DEBUG: capture pre-swap state ===
+                        const oldIdxForDebug = this._currentAuthIndex;
+                        const oldPendingBefore =
+                            oldIdxForDebug >= 0 ? this._countPendingRequestsByAuth(oldIdxForDebug) : 0;
+                        const newPendingBefore = this._countPendingRequestsByAuth(authIndex);
+                        this.logger.info(
+                            `🔍 [FastSwitch-DBG] Pre-swap: rolling off #${oldIdxForDebug} (pending=${oldPendingBefore}), activating #${authIndex} (pending=${newPendingBefore})`
+                        );
+
                         // Switch to new context
                         this._activateContext(contextData.context, contextData.page, authIndex);
+
+                        // Kick off a DEBUG monitor on the rolled-off page to
+                        // trace whether its queued fetches actually run.
+                        if (oldIdxForDebug >= 0 && oldIdxForDebug !== authIndex) {
+                            this._monitorRolledOffContext(oldIdxForDebug, oldPendingBefore);
+                        }
 
                         this.logger.info(`✅ [FastSwitch] Switched to account #${authIndex} instantly!`);
                         return;
@@ -2359,8 +3147,8 @@ class BrowserManager {
 
         const page = contextData.page;
 
-        // Verify browser and page are still valid
-        if (!this.browser || !page) {
+        // Verify per-account browser and page are still valid
+        if (!this.browsers.has(targetAuthIndex) || !page) {
             this.logger.warn(
                 `[Reconnect] Browser or page is not available for account #${targetAuthIndex}, cannot perform lightweight reconnect.`
             );
@@ -2539,17 +3327,24 @@ class BrowserManager {
         }
 
         if (!this.contexts.has(authIndex)) {
-            // Context doesn't exist (was never initialized or was aborted)
-            // Still check if we need to close the browser
-            // Only close if there are no contexts AND no contexts being initialized
-            if (this.contexts.size === 0 && this.initializingContexts.size === 0 && this.browser) {
-                this.logger.info(`[Browser] All contexts closed, closing browser instance...`);
-                await this.closeBrowser();
+            // Context doesn't exist (was never initialized or was aborted).
+            // If there's a stray per-account Firefox for this index (e.g., launched
+            // then aborted before context insertion), close it.
+            const strayBrowser = this.browsers.get(authIndex);
+            if (strayBrowser) {
+                this.browsers.delete(authIndex);
+                strayBrowser.close().catch(() => {});
             }
             return;
         }
 
         const contextData = this.contexts.get(authIndex);
+
+        // Stop keep-alive ping for this context
+        if (contextData.keepAliveInterval) {
+            clearInterval(contextData.keepAliveInterval);
+            contextData.keepAliveInterval = null;
+        }
 
         // Stop health monitor for this context
         if (contextData.healthMonitorInterval) {
@@ -2596,12 +3391,20 @@ class BrowserManager {
             this.logger.warn(`[Browser] Error closing context #${authIndex}: ${e.message}`);
         }
 
-        // If this was the last context, close the browser to free resources
-        // This ensures a clean state when all accounts are deleted
-        // Only close if there are no contexts AND no contexts being initialized
-        if (this.contexts.size === 0 && this.initializingContexts.size === 0 && this.browser) {
-            this.logger.info(`[Browser] All contexts closed, closing browser instance...`);
-            await this.closeBrowser();
+        // Each account owns its own Firefox process. Tearing down this
+        // context also closes its dedicated browser — there's nothing else
+        // inside it that other accounts rely on.
+        const accountBrowser = this.browsers.get(authIndex);
+        if (accountBrowser) {
+            this.browsers.delete(authIndex);
+            try {
+                const closePromise = accountBrowser.close();
+                closePromise.catch(() => {});
+                await Promise.race([closePromise, new Promise(resolve => setTimeout(resolve, 5000))]);
+                this.logger.info(`[Browser#${authIndex}] Dedicated Firefox closed.`);
+            } catch (e) {
+                this.logger.warn(`[Browser#${authIndex}] Error closing Firefox: ${e.message}`);
+            }
         }
     }
 
@@ -2648,23 +3451,29 @@ class BrowserManager {
             this.healthMonitorInterval = null;
         }
 
-        if (this.browser) {
-            this.logger.debug("[Browser] Closing main browser instance and all contexts...");
-            try {
-                // Give close() 5 seconds, otherwise force proceed
-                const closePromise = this.browser.close();
-                // Attach a catch handler to prevent unhandled rejection if timeout wins
-                closePromise.catch(() => {
-                    // Silently ignore - the timeout will handle this
-                });
-                await Promise.race([closePromise, new Promise(resolve => setTimeout(resolve, 5000))]);
-            } catch (e) {
-                this.logger.warn(`[Browser] Error during close (ignored): ${e.message}`);
+        if (this.browsers.size > 0) {
+            this.logger.debug(
+                `[Browser] Closing ${this.browsers.size} per-account Firefox instance(s) and all contexts...`
+            );
+            // Close every per-account Firefox in parallel with a 5s race per browser.
+            const closeTasks = [];
+            for (const [idx, browser] of this.browsers.entries()) {
+                const task = (async () => {
+                    try {
+                        const closePromise = browser.close();
+                        closePromise.catch(() => {});
+                        await Promise.race([closePromise, new Promise(resolve => setTimeout(resolve, 5000))]);
+                    } catch (e) {
+                        this.logger.warn(`[Browser#${idx}] Error during close (ignored): ${e.message}`);
+                    }
+                })();
+                closeTasks.push(task);
             }
+            await Promise.all(closeTasks);
 
-            this.browser = null;
+            this.browsers.clear();
             this._cleanupAllContexts();
-            this.logger.debug("[Browser] Main browser instance and all contexts closed, currentAuthIndex reset to -1.");
+            this.logger.debug("[Browser] All per-account Firefox instances closed, currentAuthIndex reset to -1.");
         }
 
         // Reset flag after close is complete
@@ -2769,6 +3578,100 @@ class BrowserManager {
      */
     notifyWebUIActivity() {
         this._scheduleIdleRefill();
+    }
+
+    /**
+     * Usage-based auto-switch just rolled OFF `usedAuthIndex` (it hit the
+     * SWITCH_ON_USES threshold). In a rolling-window pool we want to:
+     *   1. Close that used context (gracefully, draining any in-flight work)
+     *   2. Preload the next rotation candidate to fill the freed slot
+     *
+     * This runs fire-and-forget from the AuthSwitcher callsite so the switch
+     * itself stays on the fast path. Steps 1 and 2 run sequentially in the
+     * background: close → open-next, so the pool size briefly dips to
+     * maxContexts-1 rather than ever exceeding maxContexts.
+     */
+    async evictUsedAccountAndPreloadNext(usedAuthIndex) {
+        if (typeof usedAuthIndex !== "number" || usedAuthIndex < 0) return;
+        if (usedAuthIndex === this._currentAuthIndex) {
+            this.logger.warn(`[ContextPool] Refusing to evict #${usedAuthIndex}: it is still the active account.`);
+            return;
+        }
+        if (!this.contexts.has(usedAuthIndex) && !this.initializingContexts.has(usedAuthIndex)) {
+            this.logger.debug(`[ContextPool] Rolling evict: #${usedAuthIndex} not in pool, nothing to close.`);
+        } else {
+            // Pre-drain grace window: under rapid usage-based switches the
+            // same brief moment where we call closeContext would land while
+            // the just-rolled-off account still has in-flight fetches that
+            // simply need a few seconds to complete on the browser side. If
+            // we enter graceful-drain (and closeContext) immediately those
+            // fetches can get starved (observed: 10/22 requests timed out
+            // at exactly 60s). Waiting ~5s lets most legitimate in-flight
+            // requests finish naturally before drain even starts.
+            const preDrainDelayMs = 5000;
+            this.logger.info(
+                `[ContextPool] Rolling evict: #${usedAuthIndex} scheduled for close after ${preDrainDelayMs}ms grace window (then drain up to ${this.config.contextCloseDrainTimeoutMs}ms), preloading next rotation candidate afterward...`
+            );
+            await new Promise(resolve => setTimeout(resolve, preDrainDelayMs));
+
+            // Short-circuit: the account may have been revived as current
+            // again (a request-triggered switch back) during the grace
+            // window; skip the close in that case.
+            if (usedAuthIndex === this._currentAuthIndex) {
+                this.logger.info(
+                    `[ContextPool] Rolling evict: #${usedAuthIndex} became active again during grace window, skipping close.`
+                );
+                return;
+            }
+
+            // IMPORTANT: do NOT call closeConnectionByAuth() here. That
+            // closes every MessageQueue bound to this authIndex with
+            // reason "reconnect_cleanup", which aborts any in-flight
+            // dequeue() and fails the request. Instead, let
+            // closeContext(graceful:true) drain the in-flight requests
+            // first — only after the drain window closes does it tear
+            // down the Playwright context, and the WS disconnect it
+            // triggers then closes any still-open queues via the
+            // normal grace-period path.
+            try {
+                await this.closeContext(usedAuthIndex, { graceful: true });
+            } catch (e) {
+                this.logger.warn(`[ContextPool] Rolling evict close failed for #${usedAuthIndex}: ${e.message}`);
+            }
+        }
+
+        // Now preload the next rotation candidate that isn't already in the pool.
+        const maxContexts = this.config.maxContexts;
+        if (!maxContexts || maxContexts === 0) return;
+        const used = this.contexts.size + this.initializingContexts.size;
+        if (used >= maxContexts) {
+            this.logger.debug(`[ContextPool] Rolling preload skipped: pool already at ${used}/${maxContexts}.`);
+            return;
+        }
+
+        const rotation = this.authSource.getRotationIndices();
+        if (!rotation || rotation.length === 0) return;
+
+        const currentCanonical =
+            this._currentAuthIndex >= 0 ? this.authSource.getCanonicalIndex(this._currentAuthIndex) : null;
+        const startPos = currentCanonical !== null ? Math.max(rotation.indexOf(currentCanonical), 0) : 0;
+        const activeCanonical = new Set(
+            [...this.contexts.keys(), ...this.initializingContexts].map(
+                idx => this.authSource.getCanonicalIndex(idx) ?? idx
+            )
+        );
+
+        const candidates = [];
+        for (let i = 1; i <= rotation.length; i++) {
+            const idx = rotation[(startPos + i) % rotation.length];
+            if (!activeCanonical.has(idx)) candidates.push(idx);
+        }
+        if (candidates.length === 0) return;
+
+        this.logger.info(
+            `[ContextPool] Rolling preload: loading next candidate #${candidates[0]} into slot freed by #${usedAuthIndex}.`
+        );
+        this._preloadBackgroundContexts(candidates, maxContexts);
     }
 
     _scheduleIdleRefill() {

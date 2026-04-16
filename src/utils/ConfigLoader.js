@@ -22,6 +22,7 @@ class ConfigLoader {
         const config = {
             apiKeys: [],
             apiKeySource: "Not set",
+            autoSwitchCooldownMs: 2000,
             browserExecutablePath: null,
             contextCloseDrainTimeoutMs: 60000,
             enableAuthUpdate: true,
@@ -36,6 +37,7 @@ class ConfigLoader {
             maxContexts: 1,
             maxRetries: 3,
             retryDelay: 2000,
+            rollingPreloadCount: 1,
             startupParallelInitLimit: 3,
             startupSyncPreloadCount: null,
             streamingMode: "real",
@@ -89,9 +91,17 @@ class ConfigLoader {
             const parsed = parseInt(process.env.SWITCH_TIMEOUT_MS, 10);
             config.switchTimeoutMs = Number.isFinite(parsed) ? Math.max(1000, parsed) : config.switchTimeoutMs;
         }
+        if (process.env.AUTO_SWITCH_COOLDOWN_MS) {
+            const parsed = parseInt(process.env.AUTO_SWITCH_COOLDOWN_MS, 10);
+            config.autoSwitchCooldownMs = Number.isFinite(parsed) ? Math.max(0, parsed) : config.autoSwitchCooldownMs;
+        }
         if (process.env.STARTUP_SYNC_PRELOAD_COUNT) {
             const parsed = parseInt(process.env.STARTUP_SYNC_PRELOAD_COUNT, 10);
             config.startupSyncPreloadCount = Number.isFinite(parsed) ? Math.max(1, parsed) : null;
+        }
+        if (process.env.ROLLING_PRELOAD_COUNT) {
+            const parsed = parseInt(process.env.ROLLING_PRELOAD_COUNT, 10);
+            config.rollingPreloadCount = Number.isFinite(parsed) ? Math.max(0, parsed) : config.rollingPreloadCount;
         }
         if (process.env.STARTUP_PARALLEL_INIT_LIMIT) {
             const parsed = parseInt(process.env.STARTUP_PARALLEL_INIT_LIMIT, 10);
@@ -99,10 +109,13 @@ class ConfigLoader {
                 ? Math.max(1, parsed)
                 : config.startupParallelInitLimit;
         }
-        // Default: fill the whole pool at startup. In unlimited mode we fall
-        // back to 1 so boot isn't pinned to every available account.
+        // Default: fill the whole pool at startup, including any rolling
+        // pre-warm standby slots so the first burst of traffic hits a
+        // fully primed pool. In unlimited mode we fall back to 1 so boot
+        // isn't pinned to every available account.
         if (config.startupSyncPreloadCount === null || config.startupSyncPreloadCount === undefined) {
-            config.startupSyncPreloadCount = config.maxContexts > 0 ? config.maxContexts : 1;
+            config.startupSyncPreloadCount =
+                config.maxContexts > 0 ? config.maxContexts + Math.max(0, config.rollingPreloadCount || 0) : 1;
         }
         if (process.env.CAMOUFOX_EXECUTABLE_PATH) config.browserExecutablePath = process.env.CAMOUFOX_EXECUTABLE_PATH;
         if (process.env.API_KEYS) {
@@ -195,12 +208,16 @@ class ConfigLoader {
         this.logger.info(`  Auto Update Auth: ${config.enableAuthUpdate}`);
         this.logger.info(`  Usage Stats: ${config.enableUsageStats}`);
         this.logger.info(`  Max Contexts: ${config.maxContexts === 0 ? "Unlimited" : config.maxContexts}`);
+        this.logger.info(
+            `  Rolling Preload Count (extra pre-warmed contexts beyond Max Contexts): ${config.rollingPreloadCount}`
+        );
         this.logger.info(`  Startup Sync Preload Count: ${config.startupSyncPreloadCount}`);
         this.logger.info(`  Startup Parallel Init Limit: ${config.startupParallelInitLimit}`);
         this.logger.info(
             `  Context Close Drain Timeout: ${config.contextCloseDrainTimeoutMs > 0 ? `${config.contextCloseDrainTimeoutMs}ms` : "Disabled (force close)"}`
         );
         this.logger.info(`  Switch Timeout (deadline from trigger): ${config.switchTimeoutMs}ms`);
+        this.logger.info(`  Auto-Switch Cooldown (between usage-based fires): ${config.autoSwitchCooldownMs}ms`);
         this.logger.info(
             `  Usage-based Switch Threshold: ${
                 config.switchOnUses > 0 ? `Switch after every ${config.switchOnUses} requests` : "Disabled"

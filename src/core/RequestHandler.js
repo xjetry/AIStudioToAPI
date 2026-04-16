@@ -197,13 +197,106 @@ class RequestHandler {
      * already in progress; `switchToNextAuth()` itself also short-circuits in
      * that case, but checking here keeps the log clean.
      */
+
+    /**
+     * Pick a loaded pool context as the dispatch target for a new request.
+     * Replaces the legacy "always dispatch to currentAuthIndex" baton model
+     * with a least-inflight policy across all currently-loaded contexts, so
+     * a burst of concurrent requests fans out across the hot pool instead
+     * of piling up on one account while the others sit idle.
+     *
+     * Selection rules:
+     *   1. Walk browserManager.contexts (fully-initialized, dispatchable).
+     *   2. For each, read ConnectionRegistry.getInflightCountForAuth.
+     *   3. Return the one with the fewest in-flight requests. Ties prefer
+     *      currentAuthIndex so the WebUI's "active" indicator matches real
+     *      load when the pool is idle.
+     *   4. If no contexts are loaded (startup / error state), fall back to
+     *      currentAuthIndex so the legacy error paths still fire.
+     *
+     * Called synchronously from every createMessageQueue call site. Because
+     * createMessageQueue immediately increments the registry's in-flight
+     * count for the chosen authIndex, a subsequent call in the same
+     * microtask naturally picks a different context.
+     *
+     * @returns {number} authIndex to bind the next request to
+     */
+    _pickDispatchAuthIndex() {
+        const bm = this.browserManager;
+        const registry = this.connectionRegistry;
+        if (!bm || !bm.contexts || bm.contexts.size === 0 || !registry) {
+            return this.currentAuthIndex;
+        }
+        const loaded = [];
+        for (const [idx, data] of bm.contexts.entries()) {
+            if (!data || !data.page || data.page.isClosed?.()) continue;
+            if (data.dispatchReady !== true) continue;
+            loaded.push(idx);
+        }
+        if (loaded.length === 0) return this.currentAuthIndex;
+        if (loaded.length === 1) return loaded[0];
+
+        const currentIdx = this.currentAuthIndex;
+        let bestIdx = loaded[0];
+        let bestCount =
+            typeof registry.getInflightCountForAuth === "function" ? registry.getInflightCountForAuth(bestIdx) : 0;
+        for (let i = 1; i < loaded.length; i++) {
+            const idx = loaded[i];
+            const count =
+                typeof registry.getInflightCountForAuth === "function" ? registry.getInflightCountForAuth(idx) : 0;
+            if (count < bestCount) {
+                bestCount = count;
+                bestIdx = idx;
+            } else if (count === bestCount && idx === currentIdx) {
+                bestIdx = idx;
+            }
+        }
+        return bestIdx;
+    }
+
     _maybeFireBackgroundSwitchForUsage() {
         if (!this.authSwitcher.shouldSwitchByUsage()) return;
         if (this.authSwitcher.isSystemBusy) return;
+
+        // Auto-switch cooldown: under burst load with a small SWITCH_ON_USES
+        // threshold, sequential switches would fire in microseconds (e.g.,
+        // 3→4→5→6→7 in <1s). Camoufox single-process Firefox can't give the
+        // rolled-off contexts enough CPU to kick off their in-flight fetches
+        // that quickly, and those requests ultimately time out during the
+        // rolling eviction drain. Enforcing a minimum gap between auto-
+        // switches preserves enough CPU time on each rolled-off context for
+        // its batch to actually start running.
+        const cooldownMs = this.authSwitcher.autoSwitchCooldownMs;
+        const sinceLastFire = Date.now() - this.authSwitcher._lastAutoSwitchFiredAt;
+        if (cooldownMs > 0 && sinceLastFire < cooldownMs) {
+            // Coalesce: if a delayed fire is already scheduled, do nothing.
+            // The scheduled timer will re-check state and fire when ready.
+            if (this.authSwitcher._pendingAutoSwitchTimer) return;
+            const delayMs = cooldownMs - sinceLastFire;
+            this.logger.info(
+                `[Auth] Auto-switch cooldown active (${sinceLastFire}ms since last fire, cooldown=${cooldownMs}ms); delaying switch by ${delayMs}ms to give rolled-off account breathing room.`
+            );
+            this.authSwitcher._pendingAutoSwitchTimer = setTimeout(() => {
+                this.authSwitcher._pendingAutoSwitchTimer = null;
+                if (!this.authSwitcher.shouldSwitchByUsage()) return;
+                if (this.authSwitcher.isSystemBusy) return;
+                this._fireUsageBasedSwitchNow();
+            }, delayMs);
+            if (this.authSwitcher._pendingAutoSwitchTimer.unref) {
+                this.authSwitcher._pendingAutoSwitchTimer.unref();
+            }
+            return;
+        }
+
+        this._fireUsageBasedSwitchNow();
+    }
+
+    _fireUsageBasedSwitchNow() {
+        this.authSwitcher._lastAutoSwitchFiredAt = Date.now();
         this.logger.info(
             `[Auth] Rotation count reached switching threshold (${this.authSwitcher.usageCount}/${this.config.switchOnUses}), firing background account switch...`
         );
-        this.authSwitcher.switchToNextAuth().catch(err => {
+        this.authSwitcher.switchToNextAuth({ waitForCurrentIssued: true }).catch(err => {
             this.logger.error(`[Auth] Background account switching task failed: ${err.message}`);
         });
     }
@@ -572,6 +665,22 @@ class RequestHandler {
             return true;
         }
 
+        // Multi-hot dispatch bypass: under the multi-hot dispatcher,
+        // request routing uses `_pickDispatchAuthIndex()` which binds
+        // to any loaded pool context — it does NOT depend on
+        // `currentAuthIndex`. A background switch only moves the
+        // currentAuthIndex pointer (UI / rotation state); new requests
+        // shouldn't need to wait for it to commit when the pool
+        // already has dispatchable contexts. Gating was the old
+        // single-baton behavior that manifested as "every 5 requests,
+        // handlers 6-22 all block until the switch commits" — the
+        // 5-wave stagger observed under burst load.
+        // Fall through to the old wait logic only when the pool has
+        // zero loaded contexts (no multi-hot target available).
+        if (this.browserManager && this.browserManager.contexts && this.browserManager.contexts.size > 0) {
+            return true;
+        }
+
         const {
             busyMessage = "Server undergoing internal maintenance (account switching/recovery), please try again later.",
             connectionMessage = "Service temporarily unavailable: Connection not established after switching.",
@@ -870,7 +979,7 @@ class RequestHandler {
                 // Create message queue inside try-catch to handle invalid authIndex
                 const messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
-                    this.currentAuthIndex,
+                    this._pickDispatchAuthIndex(),
                     proxyRequest.request_attempt_id
                 );
                 this._setupClientDisconnectHandler(res, requestId);
@@ -959,7 +1068,7 @@ class RequestHandler {
                 // Create message queue inside try-catch to handle invalid authIndex
                 const messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
-                    this.currentAuthIndex,
+                    this._pickDispatchAuthIndex(),
                     proxyRequest.request_attempt_id
                 );
                 this._setupClientDisconnectHandler(res, requestId);
@@ -1066,7 +1175,7 @@ class RequestHandler {
                 // Create message queue inside try-catch to handle invalid authIndex
                 const messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
-                    this.currentAuthIndex,
+                    this._pickDispatchAuthIndex(),
                     proxyRequest.request_attempt_id
                 );
                 this._setupClientDisconnectHandler(res, requestId);
@@ -1084,7 +1193,7 @@ class RequestHandler {
                             this.currentAuthIndex,
                             this._getAccountNameForIndex(this.currentAuthIndex)
                         );
-                        this._forwardRequest(proxyRequest);
+                        await this._forwardRequest(proxyRequest);
                         initialMessage = await currentQueue.dequeue();
 
                         const initialStatus = Number(initialMessage?.status);
@@ -1115,7 +1224,7 @@ class RequestHandler {
                             this._advanceProxyRequestAttempt(proxyRequest);
                             currentQueue = this.connectionRegistry.createMessageQueue(
                                 requestId,
-                                this.currentAuthIndex,
+                                this._pickDispatchAuthIndex(),
                                 proxyRequest.request_attempt_id
                             );
                             continue;
@@ -1461,7 +1570,7 @@ class RequestHandler {
                 // Create message queue inside try-catch to handle invalid authIndex
                 const messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
-                    this.currentAuthIndex,
+                    this._pickDispatchAuthIndex(),
                     proxyRequest.request_attempt_id
                 );
                 this._setupClientDisconnectHandler(res, requestId);
@@ -1479,7 +1588,7 @@ class RequestHandler {
                             this.currentAuthIndex,
                             this._getAccountNameForIndex(this.currentAuthIndex)
                         );
-                        this._forwardRequest(proxyRequest);
+                        await this._forwardRequest(proxyRequest);
                         initialMessage = await currentQueue.dequeue();
 
                         const initialStatus = Number(initialMessage?.status);
@@ -1510,7 +1619,7 @@ class RequestHandler {
                             this._advanceProxyRequestAttempt(proxyRequest);
                             currentQueue = this.connectionRegistry.createMessageQueue(
                                 requestId,
-                                this.currentAuthIndex,
+                                this._pickDispatchAuthIndex(),
                                 proxyRequest.request_attempt_id
                             );
                             continue;
@@ -1833,7 +1942,7 @@ class RequestHandler {
                 // Create message queue inside try-catch to handle invalid authIndex
                 const messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
-                    this.currentAuthIndex,
+                    this._pickDispatchAuthIndex(),
                     proxyRequest.request_attempt_id
                 );
                 this._setupClientDisconnectHandler(res, requestId);
@@ -1851,7 +1960,7 @@ class RequestHandler {
                             this.currentAuthIndex,
                             this._getAccountNameForIndex(this.currentAuthIndex)
                         );
-                        this._forwardRequest(proxyRequest);
+                        await this._forwardRequest(proxyRequest);
                         initialMessage = await currentQueue.dequeue();
 
                         const initialStatus = Number(initialMessage?.status);
@@ -1882,7 +1991,7 @@ class RequestHandler {
                             this._advanceProxyRequestAttempt(proxyRequest);
                             currentQueue = this.connectionRegistry.createMessageQueue(
                                 requestId,
-                                this.currentAuthIndex,
+                                this._pickDispatchAuthIndex(),
                                 proxyRequest.request_attempt_id
                             );
                             continue;
@@ -2169,7 +2278,7 @@ class RequestHandler {
                 // Create message queue inside try-catch to handle invalid authIndex
                 const messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
-                    this.currentAuthIndex,
+                    this._pickDispatchAuthIndex(),
                     proxyRequest.request_attempt_id
                 );
                 this._setupClientDisconnectHandler(res, requestId);
@@ -2179,7 +2288,7 @@ class RequestHandler {
                     this.currentAuthIndex,
                     this._getAccountNameForIndex(this.currentAuthIndex)
                 );
-                this._forwardRequest(proxyRequest);
+                await this._forwardRequest(proxyRequest);
                 const response = await messageQueue.dequeue();
 
                 if (response.event_type === "error") {
@@ -2319,7 +2428,7 @@ class RequestHandler {
             try {
                 const messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
-                    this.currentAuthIndex,
+                    this._pickDispatchAuthIndex(),
                     proxyRequest.request_attempt_id
                 );
                 this._setupClientDisconnectHandler(res, requestId);
@@ -2329,7 +2438,7 @@ class RequestHandler {
                     this.currentAuthIndex,
                     this._getAccountNameForIndex(this.currentAuthIndex)
                 );
-                this._forwardRequest(proxyRequest);
+                await this._forwardRequest(proxyRequest);
                 const response = await messageQueue.dequeue();
 
                 if (response.event_type === "error") {
@@ -2916,7 +3025,7 @@ class RequestHandler {
                 this.currentAuthIndex,
                 this._getAccountNameForIndex(this.currentAuthIndex)
             );
-            this._forwardRequest(proxyRequest);
+            await this._forwardRequest(proxyRequest);
             headerMessage = await currentQueue.dequeue();
 
             const headerStatus = Number(headerMessage?.status);
@@ -2949,7 +3058,7 @@ class RequestHandler {
                 this._advanceProxyRequestAttempt(proxyRequest);
                 currentQueue = this.connectionRegistry.createMessageQueue(
                     proxyRequest.request_id,
-                    this.currentAuthIndex,
+                    this._pickDispatchAuthIndex(),
                     proxyRequest.request_attempt_id
                 );
                 continue;
@@ -3219,7 +3328,7 @@ class RequestHandler {
                 this._getAccountNameForIndex(this.currentAuthIndex)
             );
             try {
-                this._forwardRequest(proxyRequest);
+                await this._forwardRequest(proxyRequest);
 
                 const initialMessage = await currentQueue.dequeue();
 
@@ -3314,7 +3423,7 @@ class RequestHandler {
                     this._advanceProxyRequestAttempt(proxyRequest);
                     currentQueue = this.connectionRegistry.createMessageQueue(
                         proxyRequest.request_id,
-                        this.currentAuthIndex,
+                        this._pickDispatchAuthIndex(),
                         proxyRequest.request_attempt_id
                     );
                     currentQueueAuthIndex = this.currentAuthIndex;
@@ -3360,7 +3469,7 @@ class RequestHandler {
                 this._advanceProxyRequestAttempt(proxyRequest);
                 currentQueue = this.connectionRegistry.createMessageQueue(
                     proxyRequest.request_id,
-                    this.currentAuthIndex,
+                    this._pickDispatchAuthIndex(),
                     proxyRequest.request_attempt_id
                 );
                 // Update tracked authIndex for the new queue
@@ -4122,11 +4231,37 @@ class RequestHandler {
         );
     }
 
-    _forwardRequest(proxyRequest) {
-        const connection = this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex);
+    async _forwardRequest(proxyRequest) {
+        // IMPORTANT: dispatch to the authIndex that the MessageQueue for this
+        // request is bound to, NOT to this.currentAuthIndex. The two can
+        // diverge if a background switch (usage-based or failure-based)
+        // fires between createMessageQueue() and _forwardRequest(). If we
+        // dispatched to the new currentAuthIndex, the response would come
+        // back tagged with the new authIndex and ConnectionRegistry would
+        // discard it as a cross-account stray (see _handleIncomingMessage
+        // authIndex mismatch guard), and the client would time out.
+        const boundAuthIndex = this.connectionRegistry.getAuthIndexForRequest(proxyRequest.request_id);
+        const targetAuthIndex =
+            Number.isInteger(boundAuthIndex) && boundAuthIndex >= 0 ? boundAuthIndex : this.currentAuthIndex;
+
+        if (targetAuthIndex !== this.currentAuthIndex) {
+            this.logger.debug(
+                `[Request] Forward request #${proxyRequest.request_id}: using bound authIndex=${targetAuthIndex} (currentAuthIndex=${this.currentAuthIndex} diverged mid-flight; this is expected when a background switch fires during a request)`
+            );
+        }
+
+        if (
+            targetAuthIndex !== this.currentAuthIndex &&
+            this.browserManager &&
+            typeof this.browserManager.prepareContextForDispatch === "function"
+        ) {
+            await this.browserManager.prepareContextForDispatch(targetAuthIndex);
+        }
+
+        const connection = this.connectionRegistry.getConnectionByAuth(targetAuthIndex);
         if (connection) {
             this.logger.debug(
-                `[Request] Forwarding request #${proxyRequest.request_id} via connection for authIndex=${this.currentAuthIndex}` +
+                `[Request] Forwarding request #${proxyRequest.request_id} via connection for authIndex=${targetAuthIndex}` +
                     ` (attempt=${proxyRequest.request_attempt_id})`
             );
             connection.send(
@@ -4137,7 +4272,7 @@ class RequestHandler {
             );
         } else {
             throw new Error(
-                `Unable to forward request: No WebSocket connection found for authIndex=${this.currentAuthIndex}`
+                `Unable to forward request: No WebSocket connection found for authIndex=${targetAuthIndex}`
             );
         }
     }

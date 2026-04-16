@@ -35,17 +35,29 @@ class QueueTimeoutError extends Error {
  * Responsible for managing asynchronous message enqueue and dequeue
  */
 class MessageQueue extends EventEmitter {
-    constructor(timeoutMs = 300000) {
+    constructor(timeoutMs = 300000, debugHooks = null) {
         super();
         this.messages = [];
         this.waitingResolvers = [];
         this.defaultTimeout = timeoutMs;
         this.closed = false;
         this.closeReason = null;
+        this.debugHooks = debugHooks;
+    }
+
+    _debug(message) {
+        if (typeof this.debugHooks?.log === "function") {
+            const prefix = this.debugHooks?.label ? ` label=${this.debugHooks.label}` : "";
+            this.debugHooks.log(`[Queue-DBG]${prefix} ${message}`);
+        }
     }
 
     enqueue(message) {
         if (this.closed) return;
+        const messageType = message?.event_type || message?.type || "unknown";
+        this._debug(
+            `PUT type=${messageType} queued=${this.messages.length} waiters=${this.waitingResolvers.length} closed=${this.closed}`
+        );
         if (this.waitingResolvers.length > 0) {
             const resolver = this.waitingResolvers.shift();
             // Check if resolver is still valid (not timed out). `valid` decouples
@@ -54,13 +66,16 @@ class MessageQueue extends EventEmitter {
             if (resolver && resolver.valid) {
                 resolver.valid = false;
                 if (resolver.timeoutId) clearTimeout(resolver.timeoutId);
+                this._debug(`DELIVER_DIRECT type=${messageType} remainingWaiters=${this.waitingResolvers.length}`);
                 resolver.resolve(message);
             } else {
                 // Resolver already timed out, push message to queue instead
                 this.messages.push(message);
+                this._debug(`BUFFER_AFTER_STALE type=${messageType} queued=${this.messages.length}`);
             }
         } else {
             this.messages.push(message);
+            this._debug(`BUFFER type=${messageType} queued=${this.messages.length}`);
         }
     }
 
@@ -73,17 +88,24 @@ class MessageQueue extends EventEmitter {
     async dequeue(timeoutMs = this.defaultTimeout) {
         if (this.closed) {
             const reason = this.closeReason || "unknown";
+            this._debug(`GET_REJECT_CLOSED reason=${reason}`);
             throw new QueueClosedError(`Queue is closed (reason: ${reason})`, reason);
         }
         return new Promise((resolve, reject) => {
             // Check if there are already queued messages
             if (this.messages.length > 0) {
-                resolve(this.messages.shift());
+                const message = this.messages.shift();
+                const messageType = message?.event_type || message?.type || "unknown";
+                this._debug(`GET_IMMEDIATE type=${messageType} remainingQueued=${this.messages.length}`);
+                resolve(message);
                 return;
             }
 
             // Create resolver; `valid` flag gates both the timeout and enqueue paths.
             const resolver = { reject, resolve, timeoutId: null, valid: true };
+            this._debug(
+                `GET_WAIT timeoutMs=${Number.isFinite(timeoutMs) ? timeoutMs : "infinite"} waiters=${this.waitingResolvers.length + 1}`
+            );
 
             const hasFiniteTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0;
             if (hasFiniteTimeout) {
@@ -95,6 +117,7 @@ class MessageQueue extends EventEmitter {
                     if (index !== -1) {
                         this.waitingResolvers.splice(index, 1);
                     }
+                    this._debug(`GET_TIMEOUT waiters=${this.waitingResolvers.length}`);
                     reject(new QueueTimeoutError());
                 }, timeoutMs);
             }
@@ -110,7 +133,10 @@ class MessageQueue extends EventEmitter {
                 this.waitingResolvers.shift();
                 resolver.valid = false;
                 if (resolver.timeoutId) clearTimeout(resolver.timeoutId);
-                resolve(this.messages.shift());
+                const message = this.messages.shift();
+                const messageType = message?.event_type || message?.type || "unknown";
+                this._debug(`GET_RACE_WIN type=${messageType} remainingQueued=${this.messages.length}`);
+                resolve(message);
             }
         });
     }
@@ -118,6 +144,9 @@ class MessageQueue extends EventEmitter {
     close(reason = "unknown") {
         this.closed = true;
         this.closeReason = reason;
+        this._debug(
+            `CLOSE reason=${reason} queued=${this.messages.length} waiters=${this.waitingResolvers.length}`
+        );
         this.waitingResolvers.forEach(resolver => {
             if (!resolver.valid) return;
             resolver.valid = false;
