@@ -69,6 +69,11 @@ class BrowserManager {
         // Used by ConnectionRegistry callback to skip unnecessary reconnect attempts
         this.isClosingIntentionally = false;
 
+        // Per-account intentional close tracking. closeContext sets this before
+        // tearing down a single Firefox so the browser "disconnected" handler
+        // can distinguish planned shutdowns from crashes.
+        this._intentionalCloseSet = new Set();
+
         // ConnectionRegistry reference (set after construction to avoid circular dependency)
         this.connectionRegistry = null;
 
@@ -1763,7 +1768,9 @@ class BrowserManager {
         });
         browser.on("disconnected", () => {
             this.browsers.delete(authIndex);
-            if (!this.isClosingIntentionally) {
+            const intentional = this.isClosingIntentionally || this._intentionalCloseSet.has(authIndex);
+            this._intentionalCloseSet.delete(authIndex);
+            if (!intentional) {
                 this.logger.error(`❌ [Browser#${authIndex}] Firefox unexpectedly disconnected!`);
                 // Scrub just this account's context rather than wiping the pool —
                 // the other accounts have their own Firefox processes and are
@@ -3141,6 +3148,7 @@ class BrowserManager {
         // inside it that other accounts rely on.
         const accountBrowser = this.browsers.get(authIndex);
         if (accountBrowser) {
+            this._intentionalCloseSet.add(authIndex);
             this.browsers.delete(authIndex);
             try {
                 const closePromise = accountBrowser.close();

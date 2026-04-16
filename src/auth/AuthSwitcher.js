@@ -416,20 +416,28 @@ class AuthSwitcher {
                 this.logger.info(`[Auth] ${successMessage}`);
                 if (sendErrorCallback) sendErrorCallback(successMessage);
 
-                // Evict the rate-limited account from the pool and preload
-                // the next rotation candidate into the freed slot. Without
-                // this the 429/503'd account keeps occupying a pool slot,
-                // blocking new accounts from warming up.
+                // Evict the rate-limited account from the pool so it frees
+                // its slot. We do NOT call evictUsedAccountAndPreloadNext
+                // here because switchToNextAuth already fired a background
+                // rebalanceContextPool() which handles preloading the next
+                // rotation candidate. Doing both would double-preload and
+                // temporarily exceed maxContexts.
                 if (
                     isImmediateSwitch &&
                     previousAuthIndex >= 0 &&
                     previousAuthIndex !== this.currentAuthIndex
                 ) {
-                    this.browserManager.evictUsedAccountAndPreloadNext(previousAuthIndex).catch(err => {
-                        this.logger.warn(
-                            `[Auth] Background eviction of rate-limited account #${previousAuthIndex} failed: ${err.message}`
-                        );
-                    });
+                    // Brief grace window for in-flight requests, then close.
+                    const gracePeriodMs = 5000;
+                    setTimeout(() => {
+                        // Re-check: account may have become active again.
+                        if (previousAuthIndex === this.currentAuthIndex) return;
+                        this.browserManager.closeContext(previousAuthIndex, { graceful: true }).catch(err => {
+                            this.logger.warn(
+                                `[Auth] Background eviction of rate-limited account #${previousAuthIndex} failed: ${err.message}`
+                            );
+                        });
+                    }, gracePeriodMs);
                 }
             } catch (error) {
                 let userMessage = `❌ Fatal error: Unknown switching error occurred: ${error.message}`;
