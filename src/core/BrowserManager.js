@@ -89,11 +89,6 @@ class BrowserManager {
         // Map: authIndex -> { success: boolean, failed: boolean }
         this._wsInitState = new Map();
 
-        // Active rolled-off monitors (authIndex -> intervalId). Used by
-        // _monitorRolledOffContext to trace whether a just-rolled-off page
-        // is actually processing its queued work or sitting frozen.
-        this._rolledOffMonitors = new Map();
-
         // Idle auto-refill: after ~5s of no WebUI account-related activity,
         // if the pool has free capacity, preload the next rotation accounts
         // until we hit maxContexts. Reset/rescheduled on every WebUI touch.
@@ -685,61 +680,6 @@ class BrowserManager {
     /**
      * Count outstanding in-flight requests currently bound to a given auth
      * index, by walking the shared ConnectionRegistry.messageQueues map.
-     * Used by the FastSwitch rate-limit + rolled-off monitor for DEBUG
-     * visibility into whether a just-rolled-off page is actually draining.
-     * @param {number} authIndex
-     * @returns {number}
-     */
-    _countPendingRequestsByAuth(authIndex) {
-        if (!this.connectionRegistry || !this.connectionRegistry.messageQueues) return 0;
-        let count = 0;
-        for (const entry of this.connectionRegistry.messageQueues.values()) {
-            if (entry && entry.authIndex === authIndex) count++;
-        }
-        return count;
-    }
-
-    /**
-     * DEBUG-only: after a FastSwitch rolls off a context, poll its
-     * pending-request count every ~2s for ~20s and log the delta, so we
-     * can see whether the rolled-off page is draining its in-flight
-     * fetches or sitting frozen. Overwrites any prior monitor for the
-     * same authIndex.
-     * @param {number} authIndex - The just-rolled-off authIndex
-     * @param {number} initialPending - Pending count captured pre-swap
-     */
-    _monitorRolledOffContext(authIndex, initialPending) {
-        const prior = this._rolledOffMonitors.get(authIndex);
-        if (prior) clearInterval(prior);
-
-        const startedAt = Date.now();
-        const durationMs = 20000;
-        const intervalMs = 2000;
-
-        this.logger.info(
-            `🔬 [RolledOff-DBG] Monitoring #${authIndex} for ${durationMs}ms (initial pending=${initialPending})`
-        );
-
-        const id = setInterval(() => {
-            const elapsed = Date.now() - startedAt;
-            const currentPending = this._countPendingRequestsByAuth(authIndex);
-            const isStillInPool = this.contexts.has(authIndex);
-            const isCurrent = this._currentAuthIndex === authIndex;
-            this.logger.info(
-                `🔬 [RolledOff-DBG] #${authIndex} t+${elapsed}ms pending=${currentPending} inPool=${isStillInPool} isCurrent=${isCurrent}`
-            );
-            if (elapsed >= durationMs || currentPending === 0 || !isStillInPool) {
-                clearInterval(id);
-                this._rolledOffMonitors.delete(authIndex);
-                this.logger.info(
-                    `🔬 [RolledOff-DBG] #${authIndex} monitor stopped (elapsed=${elapsed}ms, finalPending=${currentPending}, drained=${currentPending === 0})`
-                );
-            }
-        }, intervalMs);
-        id.unref?.();
-        this._rolledOffMonitors.set(authIndex, id);
-    }
-
     /**
      * Activate a context as the current one: update legacy references, reset wakeup state,
      * and start background services (health monitor + wakeup + active trigger).
@@ -2437,13 +2377,13 @@ class BrowserManager {
                     const ctx = this.contexts.get(authIndex);
                     if (ctx) ctx.dispatchReady = true;
                 }
-                this.logger.info(`[NetProbe#${authIndex}] REQUEST ${request.method()} ${url}`);
+                this.logger.debug(`[NetProbe#${authIndex}] REQUEST ${request.method()} ${url}`);
             });
 
             page.on("response", response => {
                 const url = response.url();
                 if (!shouldProbeNetwork(url)) return;
-                this.logger.info(
+                this.logger.debug(
                     `[NetProbe#${authIndex}] RESPONSE ${response.status()} ${response.request().method()} ${url}`
                 );
             });
@@ -2452,7 +2392,7 @@ class BrowserManager {
                 const url = request.url();
                 if (!shouldProbeNetwork(url)) return;
                 const failureText = request.failure()?.errorText || "unknown";
-                this.logger.info(`[NetProbe#${authIndex}] FAILED ${request.method()} ${url} error=${failureText}`);
+                this.logger.debug(`[NetProbe#${authIndex}] FAILED ${request.method()} ${url} error=${failureText}`);
             });
 
             // NOTE: Removed bringToFront/window.focus/humanMovement wakeup step.
@@ -2755,23 +2695,8 @@ class BrowserManager {
                             }
                         }
 
-                        // === DEBUG: capture pre-swap state ===
-                        const oldIdxForDebug = this._currentAuthIndex;
-                        const oldPendingBefore =
-                            oldIdxForDebug >= 0 ? this._countPendingRequestsByAuth(oldIdxForDebug) : 0;
-                        const newPendingBefore = this._countPendingRequestsByAuth(authIndex);
-                        this.logger.info(
-                            `🔍 [FastSwitch-DBG] Pre-swap: rolling off #${oldIdxForDebug} (pending=${oldPendingBefore}), activating #${authIndex} (pending=${newPendingBefore})`
-                        );
-
                         // Switch to new context
                         this._activateContext(contextData.context, contextData.page, authIndex);
-
-                        // Kick off a DEBUG monitor on the rolled-off page to
-                        // trace whether its queued fetches actually run.
-                        if (oldIdxForDebug >= 0 && oldIdxForDebug !== authIndex) {
-                            this._monitorRolledOffContext(oldIdxForDebug, oldPendingBefore);
-                        }
 
                         this.logger.info(`✅ [FastSwitch] Switched to account #${authIndex} instantly!`);
                         return;

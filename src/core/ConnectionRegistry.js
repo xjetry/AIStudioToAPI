@@ -249,9 +249,6 @@ class ConnectionRegistry extends EventEmitter {
                 return;
             }
             const entry = this.messageQueues.get(requestId);
-            this.logger.info(
-                `[Registry-DBG] RX authIndex=${messageAuthIndex} request_id=${requestId} attempt=${parsedMessage.request_attempt_id || "missing"} type=${eventType} queue=${entry ? "present" : "missing"} boundAuth=${entry?.authIndex ?? "missing"} boundAttempt=${entry?.requestAttemptId || "missing"}`
-            );
             if (entry) {
                 // Verify that the message comes from the correct authIndex
                 if (messageAuthIndex !== entry.authIndex) {
@@ -284,21 +281,12 @@ class ConnectionRegistry extends EventEmitter {
         switch (event_type) {
             case "response_headers":
             case "chunk":
-                this.logger.info(
-                    `[Registry-DBG] ROUTE request_id=${message.request_id} attempt=${message.request_attempt_id || "missing"} type=${event_type}`
-                );
                 queue.enqueue(message);
                 break;
             case "error":
-                this.logger.info(
-                    `[Registry-DBG] ROUTE request_id=${message.request_id} attempt=${message.request_attempt_id || "missing"} type=${event_type}`
-                );
                 queue.enqueue(message);
                 break;
             case "stream_close":
-                this.logger.info(
-                    `[Registry-DBG] ROUTE request_id=${message.request_id} attempt=${message.request_attempt_id || "missing"} type=STREAM_END`
-                );
                 queue.enqueue({ type: "STREAM_END" });
                 break;
             default:
@@ -448,10 +436,7 @@ class ConnectionRegistry extends EventEmitter {
             this.messageQueues.delete(requestId);
         }
 
-        const queue = new MessageQueue(undefined, {
-            label: `request=${requestId} authIndex=${authIndex} attempt=${requestAttemptId || "missing"}`,
-            log: message => this.logger.info(message),
-        });
+        const queue = new MessageQueue();
         // Add timestamp for stale queue detection
         this.messageQueues.set(requestId, {
             authIndex,
