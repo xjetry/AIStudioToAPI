@@ -263,14 +263,8 @@ class RequestProcessor {
 
                 const requestUrl = this._constructUrl(requestSpec);
                 const requestConfig = this._buildRequestConfig(requestSpec, abortController.signal);
-                Logger.output(
-                    `[Fetch-DBG] START request_id=${operationId} attempt=${requestAttemptId} method=${requestSpec.method} url=${requestUrl}`
-                );
 
                 const response = await fetch(requestUrl, requestConfig);
-                Logger.output(
-                    `[Fetch-DBG] END request_id=${operationId} attempt=${requestAttemptId} status=${response.status} ok=${response.ok}`
-                );
 
                 if (!response.ok) {
                     const errorBody = await response.text();
@@ -284,9 +278,6 @@ class RequestProcessor {
                 cancelTimeout();
                 return response;
             } catch (error) {
-                Logger.output(
-                    `[Fetch-DBG] ERROR request_id=${operationId} attempt=${requestAttemptId} name=${error.name || "Error"} message=${error.message}`
-                );
                 cancelTimeout();
                 throw error;
             }
