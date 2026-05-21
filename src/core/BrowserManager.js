@@ -373,14 +373,9 @@ class BrowserManager {
         return Math.abs(hashValue);
     }
 
-    /**
-     * Feature: Generate Privacy Protection Script (Stealth Mode)
-     * Injects specific GPU info and masks webdriver properties to avoid bot detection.
-     */
-    _getPrivacyProtectionScript(authIndex) {
+    _getFingerprintSeedSource(authIndex) {
         let seedSource = `account_salt_${authIndex}`;
 
-        // Attempt to use accountName (email) for better consistency across index reordering
         try {
             const authData = this.authSource.getAuth(authIndex);
             if (authData && authData.accountName && typeof authData.accountName === "string") {
@@ -393,46 +388,147 @@ class BrowserManager {
             // Fallback to index-based seed if auth data read fails
         }
 
-        // Use a consistent seed so the fingerprint remains static for this specific account
-        let seed = this._generateIdentitySeed(seedSource);
+        return seedSource;
+    }
 
-        // Pseudo-random generator based on the seed
-        const deterministicRandom = () => {
-            const x = Math.sin(seed++) * 10000;
+    _createDeterministicRandom(seed) {
+        let currentSeed = seed;
+        return () => {
+            const x = Math.sin(currentSeed++) * 10000;
             return x - Math.floor(x);
         };
+    }
 
-        // Select a GPU profile consistent with this account
-        const gpuProfiles = [
-            { renderer: "Intel Iris OpenGL Engine", vendor: "Intel Inc." },
-            {
-                renderer: "ANGLE (NVIDIA, NVIDIA GeForce GTX 1050 Ti Direct3D11 vs_5_0 ps_5_0, D3D11)",
-                vendor: "Google Inc. (NVIDIA)",
-            },
-            {
-                renderer: "ANGLE (AMD, AMD Radeon RX 580 Series Direct3D11 vs_5_0 ps_5_0, D3D11)",
-                vendor: "Google Inc. (AMD)",
-            },
+    _getFingerprintProfile(authIndex) {
+        const seed = this._generateIdentitySeed(this._getFingerprintSeedSource(authIndex));
+        const deterministicRandom = this._createDeterministicRandom(seed);
+        const pick = values => values[Math.floor(deterministicRandom() * values.length)];
+        const version = "146.0.7680.80";
+        const isMac = deterministicRandom() < 0.25;
+        const locales = [
+            { acceptLanguage: "en-US,en;q=0.9", language: "en-US", languages: ["en-US", "en"], locale: "en-US" },
         ];
-        const profile = gpuProfiles[Math.floor(deterministicRandom() * gpuProfiles.length)];
+        const screenProfile = pick(
+            isMac
+                ? [
+                      { screen: { availHeight: 860, availWidth: 1440, height: 900, width: 1440 } },
+                      { screen: { availHeight: 1070, availWidth: 1728, height: 1117, width: 1728 } },
+                  ]
+                : [
+                      { screen: { availHeight: 1040, availWidth: 1920, height: 1080, width: 1920 } },
+                      { screen: { availHeight: 1400, availWidth: 2560, height: 1440, width: 2560 } },
+                  ]
+        );
+        const localeProfile = pick(locales);
 
-        // We inject a noise variable to make the environment unique but stable
+        const profile = isMac
+            ? {
+                  browserName: "Chrome",
+                  browserVersion: version,
+                  colorDepth: 24,
+                  deviceMemory: pick([8, 16]),
+                  devicePixelRatio: 2,
+                  gpu: pick([
+                      { renderer: "Intel Iris OpenGL Engine", vendor: "Intel Inc." },
+                      { renderer: "Intel Iris Plus Graphics OpenGL Engine", vendor: "Intel Inc." },
+                  ]),
+                  hardwareConcurrency: pick([8, 10, 12]),
+                  maxTouchPoints: 0,
+                  mobile: false,
+                  platform: "MacIntel",
+                  pluginCount: pick([4, 5, 6]),
+                  userAgent: `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version} Safari/537.36`,
+                  vendor: "Google Inc.",
+              }
+            : {
+                  browserName: "Chrome",
+                  browserVersion: version,
+                  colorDepth: 24,
+                  deviceMemory: pick([4, 8, 16]),
+                  devicePixelRatio: 1,
+                  gpu: pick([
+                      {
+                          renderer: "ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                          vendor: "Google Inc. (Intel)",
+                      },
+                      {
+                          renderer: "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                          vendor: "Google Inc. (Intel)",
+                      },
+                      {
+                          renderer: "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                          vendor: "Google Inc. (Intel)",
+                      },
+                      {
+                          renderer: "ANGLE (NVIDIA, NVIDIA GeForce GTX 1050 Ti Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                          vendor: "Google Inc. (NVIDIA)",
+                      },
+                      {
+                          renderer: "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                          vendor: "Google Inc. (NVIDIA)",
+                      },
+                      {
+                          renderer: "ANGLE (NVIDIA, NVIDIA GeForce RTX 2060 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                          vendor: "Google Inc. (NVIDIA)",
+                      },
+                      {
+                          renderer: "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                          vendor: "Google Inc. (NVIDIA)",
+                      },
+                      {
+                          renderer: "ANGLE (AMD, AMD Radeon(TM) Vega 8 Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                          vendor: "Google Inc. (AMD)",
+                      },
+                      {
+                          renderer: "ANGLE (AMD, AMD Radeon RX 580 Series Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                          vendor: "Google Inc. (AMD)",
+                      },
+                      {
+                          renderer: "ANGLE (AMD, AMD Radeon RX 6600 XT Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                          vendor: "Google Inc. (AMD)",
+                      },
+                  ]),
+                  hardwareConcurrency: pick([4, 8, 12, 16]),
+                  maxTouchPoints: 0,
+                  mobile: false,
+                  platform: "Win32",
+                  pluginCount: pick([3, 4, 5, 6, 7]),
+                  userAgent: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version} Safari/537.36`,
+                  vendor: "Google Inc.",
+              };
+
         const randomArtifact = Math.floor(deterministicRandom() * 1000);
+
+        return {
+            ...localeProfile,
+            ...screenProfile,
+            ...profile,
+            appVersion: profile.userAgent.replace(/^Mozilla\//, ""),
+            randomArtifact,
+            seed,
+        };
+    }
+
+    /**
+     * Feature: Generate Privacy Protection Script (Stealth Mode)
+     * Injects specific GPU info and masks webdriver properties to avoid bot detection.
+     */
+    _getPrivacyProtectionScript(authIndex) {
+        const profile = this._getFingerprintProfile(authIndex);
+        const serializedProfile = JSON.stringify(profile);
 
         return `
             (function() {
-                if (window._privacyProtectionInjected) return;
-                window._privacyProtectionInjected = true;
+                const profile = ${serializedProfile};
 
                 try {
-                    // 0. Always-visible page state. In Camoufox/Firefox with
-                    //    multiple parallel browser contexts, non-current pages
-                    //    observe document.visibilityState === 'hidden', which
-                    //    causes AI Studio's stream reader / rAF / timer loops
-                    //    to pause — stalling in-flight generations on rolled-
-                    //    off accounts during rapid usage-based switching.
-                    //    Force the page to report as visible at all times so
-                    //    the background drain path can actually complete.
+                    // Pool contexts that are not the active tab observe
+                    // document.visibilityState === 'hidden' and window 'blur',
+                    // which causes AI Studio's stream reader / rAF / timer
+                    // loops and Canvas fetch pipeline to pause — stalling
+                    // in-flight generations on rolled-off accounts during
+                    // rapid usage-based switching. Force every page to report
+                    // as visible and focused so background drain can complete.
                     try {
                         Object.defineProperty(Document.prototype, 'hidden', { configurable: true, get: () => false });
                         Object.defineProperty(Document.prototype, 'visibilityState', { configurable: true, get: () => 'visible' });
@@ -451,15 +547,6 @@ class BrowserManager {
                                 };
                                 return origAddEventListener.call(this, type, wrapped, options);
                             }
-                            // Suppress blur events entirely — AI Studio's
-                            // Canvas app listens to window 'blur' to pause
-                            // its fetch dispatch pipeline when the tab
-                            // loses OS focus. Under multi-hot dispatch,
-                            // only one tab can be foreground; the rest
-                            // are effectively "blurred" forever and their
-                            // fetches stall. Swallowing the event keeps
-                            // AI Studio in its "focused" code path on
-                            // every pool context.
                             if (type === 'blur' || type === 'webkitblur') {
                                 return origAddEventListener.call(this, type, function() {}, options);
                             }
@@ -467,48 +554,358 @@ class BrowserManager {
                         };
                     } catch (_) {}
 
-                    // Force document.hasFocus() to always return true so
-                    // any code path that gates on focus (including AI
-                    // Studio's Canvas app) treats the page as focused
-                    // regardless of which tab Firefox actually put in
-                    // the foreground. Paired with the blur-event
-                    // suppression above this keeps non-foreground pool
-                    // contexts in the "has focus" state.
+                    // hasFocus()=true keeps non-foreground pool contexts in
+                    // the focused code path; paired with blur-event suppression
+                    // this prevents AI Studio's focus-gated fetch dispatch from
+                    // stalling on background tabs.
                     try {
                         Document.prototype.hasFocus = function() { return true; };
                     } catch (_) {}
-                    // Also shadow Window.prototype if any code calls
-                    // window.top.document.hasFocus via a parent ref.
                     try {
                         Object.defineProperty(window, 'onblur', { configurable: true, get: () => null, set: () => {} });
                         Object.defineProperty(window, 'onfocus', { configurable: true, get: () => null, set: () => {} });
                     } catch (_) {}
 
-                    // 1. Mask WebDriver property
+                    // Mask WebDriver property
                     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 
-                    // 2. Mock Plugins if empty
-                    if (navigator.plugins.length === 0) {
-                        Object.defineProperty(navigator, 'plugins', {
-                            get: () => new Array(${3 + Math.floor(deterministicRandom() * 3)}),
+                    const nativeSources = new WeakMap();
+
+                    const markAsNative = (fn, name) => {
+                        nativeSources.set(fn, 'function ' + name + '() { [native code] }');
+                        return fn;
+                    };
+
+                    const toStringDescriptor = Object.getOwnPropertyDescriptor(Function.prototype, 'toString');
+                    if (toStringDescriptor && typeof toStringDescriptor.value === 'function') {
+                        const originalToString = toStringDescriptor.value;
+                        const patchedToString = function toString() {
+                            if (nativeSources.has(this)) {
+                                return nativeSources.get(this);
+                            }
+                            return originalToString.call(this);
+                        };
+
+                        Object.defineProperty(Function.prototype, 'toString', {
+                            configurable: toStringDescriptor.configurable,
+                            enumerable: toStringDescriptor.enumerable,
+                            writable: toStringDescriptor.writable,
+                            value: markAsNative(patchedToString, 'toString'),
                         });
                     }
 
-                    // 3. Spoof WebGL Renderer (High Impact)
-                    const getParameterProxy = WebGLRenderingContext.prototype.getParameter;
-                    WebGLRenderingContext.prototype.getParameter = function(parameter) {
-                        // 37445: UNMASKED_VENDOR_WEBGL
-                        // 37446: UNMASKED_RENDERER_WEBGL
-                        if (parameter === 37445) return '${profile.vendor}';
-                        if (parameter === 37446) return '${profile.renderer}';
-                        return getParameterProxy.apply(this, arguments);
+                    const overrideGetterOnPrototype = (instance, key, value) => {
+                        const proto = instance && Object.getPrototypeOf(instance);
+                        if (!proto) return;
+
+                        const descriptor = Object.getOwnPropertyDescriptor(proto, key);
+                        if (descriptor && descriptor.configurable === false) return;
+
+                        const nextDescriptor = {
+                            configurable: descriptor ? descriptor.configurable : true,
+                            enumerable: descriptor ? descriptor.enumerable : false,
+                            get: markAsNative(function() {
+                                return value;
+                            }, 'get ' + key),
+                        };
+
+                        if (descriptor && typeof descriptor.set === 'function') {
+                            nextDescriptor.set = descriptor.set;
+                        }
+
+                        Object.defineProperty(proto, key, nextDescriptor);
                     };
 
-                    // 4. Inject benign noise
-                    window['_canvas_noise_${randomArtifact}'] = '${randomArtifact}';
+                    const overrideMethodOnPrototype = (proto, key, factory) => {
+                        if (!proto) return;
+
+                        const descriptor = Object.getOwnPropertyDescriptor(proto, key);
+                        if (!descriptor || typeof descriptor.value !== 'function' || descriptor.configurable === false) {
+                            return;
+                        }
+
+                        Object.defineProperty(proto, key, {
+                            configurable: descriptor.configurable,
+                            enumerable: descriptor.enumerable,
+                            writable: descriptor.writable,
+                            value: markAsNative(factory(descriptor.value), key),
+                        });
+                    };
+
+                    const createPluginArtifacts = count => {
+                        const pluginProto = typeof Plugin === 'function' ? Plugin.prototype : Object.prototype;
+                        const pluginArrayProto = typeof PluginArray === 'function' ? PluginArray.prototype : Object.prototype;
+                        const mimeTypeProto = typeof MimeType === 'function' ? MimeType.prototype : Object.prototype;
+                        const mimeTypeArrayProto =
+                            typeof MimeTypeArray === 'function' ? MimeTypeArray.prototype : Object.prototype;
+
+                        const defineValue = (target, key, value) => {
+                            Object.defineProperty(target, key, {
+                                configurable: true,
+                                enumerable: false,
+                                writable: false,
+                                value,
+                            });
+                        };
+
+                        const createMimeType = (type, getEnabledPlugin) => {
+                            const mimeType = Object.create(mimeTypeProto);
+                            Object.defineProperties(mimeType, {
+                                description: {
+                                    configurable: true,
+                                    enumerable: false,
+                                    get: markAsNative(function() {
+                                        return 'Portable Document Format';
+                                    }, 'get description'),
+                                },
+                                enabledPlugin: {
+                                    configurable: true,
+                                    enumerable: false,
+                                    get: markAsNative(function() {
+                                        return getEnabledPlugin();
+                                    }, 'get enabledPlugin'),
+                                },
+                                suffixes: {
+                                    configurable: true,
+                                    enumerable: false,
+                                    get: markAsNative(function() {
+                                        return 'pdf';
+                                    }, 'get suffixes'),
+                                },
+                                type: {
+                                    configurable: true,
+                                    enumerable: false,
+                                    get: markAsNative(function() {
+                                        return type;
+                                    }, 'get type'),
+                                },
+                            });
+                            return mimeType;
+                        };
+
+                        const createPlugin = (index, mimeType) => {
+                            const plugin = Object.create(pluginProto);
+                            Object.defineProperties(plugin, {
+                                description: {
+                                    configurable: true,
+                                    enumerable: false,
+                                    get: markAsNative(function() {
+                                        return 'Portable Document Format';
+                                    }, 'get description'),
+                                },
+                                filename: {
+                                    configurable: true,
+                                    enumerable: false,
+                                    get: markAsNative(function() {
+                                        return 'internal-pdf-viewer-' + (index + 1);
+                                    }, 'get filename'),
+                                },
+                                item: {
+                                    configurable: true,
+                                    enumerable: false,
+                                    writable: true,
+                                    value: markAsNative(function(itemIndex) {
+                                        return itemIndex === 0 ? mimeType : null;
+                                    }, 'item'),
+                                },
+                                length: {
+                                    configurable: true,
+                                    enumerable: false,
+                                    get: markAsNative(function() {
+                                        return 1;
+                                    }, 'get length'),
+                                },
+                                name: {
+                                    configurable: true,
+                                    enumerable: false,
+                                    get: markAsNative(function() {
+                                        return 'Chrome PDF Plugin ' + (index + 1);
+                                    }, 'get name'),
+                                },
+                                namedItem: {
+                                    configurable: true,
+                                    enumerable: false,
+                                    writable: true,
+                                    value: markAsNative(function(nameOrType) {
+                                        return String(nameOrType) === mimeType.type ? mimeType : null;
+                                    }, 'namedItem'),
+                                },
+                            });
+
+                            defineValue(plugin, 0, mimeType);
+                            defineValue(plugin, mimeType.type, mimeType);
+                            return plugin;
+                        };
+
+                        const mimeTypes = [];
+                        const plugins = [];
+                        for (let index = 0; index < count; index++) {
+                            let pluginRef = null;
+                            const mimeType = createMimeType(
+                                index === 0 ? 'application/pdf' : 'application/x-google-chrome-pdf',
+                                () => pluginRef
+                            );
+                            const plugin = createPlugin(index, mimeType);
+                            pluginRef = plugin;
+                            mimeTypes.push(mimeType);
+                            plugins.push(plugin);
+                        }
+
+                        const mimeTypeArray = Object.create(mimeTypeArrayProto);
+                        Object.defineProperties(mimeTypeArray, {
+                            item: {
+                                configurable: true,
+                                enumerable: false,
+                                writable: true,
+                                value: markAsNative(function(index) {
+                                    return mimeTypes[index] || null;
+                                }, 'item'),
+                            },
+                            length: {
+                                configurable: true,
+                                enumerable: false,
+                                get: markAsNative(function() {
+                                    return mimeTypes.length;
+                                }, 'get length'),
+                            },
+                            namedItem: {
+                                configurable: true,
+                                enumerable: false,
+                                writable: true,
+                                value: markAsNative(function(nameOrType) {
+                                    const lookup = String(nameOrType);
+                                    return mimeTypes.find(mimeType => mimeType.type === lookup) || null;
+                                }, 'namedItem'),
+                            },
+                            [Symbol.iterator]: {
+                                configurable: true,
+                                enumerable: false,
+                                writable: true,
+                                value: markAsNative(function values() {
+                                    return mimeTypes[Symbol.iterator]();
+                                }, 'values'),
+                            },
+                        });
+
+                        const pluginArray = Object.create(pluginArrayProto);
+                        Object.defineProperties(pluginArray, {
+                            item: {
+                                configurable: true,
+                                enumerable: false,
+                                writable: true,
+                                value: markAsNative(function(index) {
+                                    return plugins[index] || null;
+                                }, 'item'),
+                            },
+                            length: {
+                                configurable: true,
+                                enumerable: false,
+                                get: markAsNative(function() {
+                                    return plugins.length;
+                                }, 'get length'),
+                            },
+                            namedItem: {
+                                configurable: true,
+                                enumerable: false,
+                                writable: true,
+                                value: markAsNative(function(nameOrFilename) {
+                                    const lookup = String(nameOrFilename);
+                                    return (
+                                        plugins.find(plugin => plugin.name === lookup || plugin.filename === lookup) ||
+                                        null
+                                    );
+                                }, 'namedItem'),
+                            },
+                            refresh: {
+                                configurable: true,
+                                enumerable: false,
+                                writable: true,
+                                value: markAsNative(function() {}, 'refresh'),
+                            },
+                            [Symbol.iterator]: {
+                                configurable: true,
+                                enumerable: false,
+                                writable: true,
+                                value: markAsNative(function values() {
+                                    return plugins[Symbol.iterator]();
+                                }, 'values'),
+                            },
+                        });
+
+                        plugins.forEach((plugin, index) => {
+                            defineValue(pluginArray, index, plugin);
+                            defineValue(pluginArray, plugin.name, plugin);
+                        });
+                        mimeTypes.forEach((mimeType, index) => {
+                            defineValue(mimeTypeArray, index, mimeType);
+                            defineValue(mimeTypeArray, mimeType.type, mimeType);
+                        });
+
+                        return { mimeTypeArray, pluginArray };
+                    };
+
+                    // 1. Navigator fields: patch prototype chain rather than leaking own properties.
+                    overrideGetterOnPrototype(navigator, 'webdriver', undefined);
+                    overrideGetterOnPrototype(navigator, 'userAgent', profile.userAgent);
+                    overrideGetterOnPrototype(navigator, 'appVersion', profile.appVersion);
+                    overrideGetterOnPrototype(navigator, 'platform', profile.platform);
+                    overrideGetterOnPrototype(navigator, 'vendor', profile.vendor);
+                    overrideGetterOnPrototype(navigator, 'language', profile.language);
+                    overrideGetterOnPrototype(navigator, 'languages', profile.languages);
+                    overrideGetterOnPrototype(navigator, 'hardwareConcurrency', profile.hardwareConcurrency);
+                    overrideGetterOnPrototype(navigator, 'deviceMemory', profile.deviceMemory);
+                    overrideGetterOnPrototype(navigator, 'maxTouchPoints', profile.maxTouchPoints);
+
+                    // 2. Plugins/mimeTypes: only emulate if the runtime currently exposes an empty collection.
+                    if (!navigator.plugins || navigator.plugins.length === 0) {
+                        const { mimeTypeArray, pluginArray } = createPluginArtifacts(profile.pluginCount);
+                        overrideGetterOnPrototype(navigator, 'plugins', pluginArray);
+                        overrideGetterOnPrototype(navigator, 'mimeTypes', mimeTypeArray);
+                    }
+
+                    // 3. Screen metadata: align on Screen.prototype / Window.prototype.
+                    const screenOverrides = {
+                        availHeight: profile.screen.availHeight,
+                        availWidth: profile.screen.availWidth,
+                        colorDepth: profile.colorDepth,
+                        height: profile.screen.height,
+                        pixelDepth: profile.colorDepth,
+                        width: profile.screen.width,
+                    };
+                    for (const [key, value] of Object.entries(screenOverrides)) {
+                        overrideGetterOnPrototype(window.screen, key, value);
+                    }
+                    overrideGetterOnPrototype(window, 'devicePixelRatio', profile.devicePixelRatio);
+
+                    // 4. WebGL: cover WebGL1, WebGL2 and the debug extension path.
+                    const debugRendererInfo = Object.freeze({
+                        UNMASKED_RENDERER_WEBGL: 37446,
+                        UNMASKED_VENDOR_WEBGL: 37445,
+                    });
+                    const patchWebGLPrototype = proto => {
+                        overrideMethodOnPrototype(proto, 'getParameter', originalMethod => function(parameter) {
+                            if (parameter === 37445) return profile.gpu.vendor;
+                            if (parameter === 37446) return profile.gpu.renderer;
+                            return Reflect.apply(originalMethod, this, arguments);
+                        });
+
+                        overrideMethodOnPrototype(proto, 'getExtension', originalMethod => function(name) {
+                            if (name === 'WEBGL_debug_renderer_info') {
+                                return debugRendererInfo;
+                            }
+                            return Reflect.apply(originalMethod, this, arguments);
+                        });
+                    };
+
+                    if (typeof WebGLRenderingContext === 'function') {
+                        patchWebGLPrototype(WebGLRenderingContext.prototype);
+                    }
+                    if (typeof WebGL2RenderingContext === 'function') {
+                        patchWebGLPrototype(WebGL2RenderingContext.prototype);
+                    }
 
                     if (window === window.top) {
-                        console.log("[ProxyClient] Privacy protection layer active: ${profile.renderer}");
+                        console.log("[ProxyClient] Privacy profile active: " + profile.browserName + " / " + profile.gpu.renderer);
 
                         // PostMessage responder for authIndex requests from cross-origin iframes
                         // Injected via addInitScript so it's ready BEFORE any iframe loads (no race condition)
@@ -2320,32 +2717,40 @@ class BrowserManager {
                 throw new Error(`Failed to get or parse auth source for index ${authIndex}.`);
             }
 
-            // Viewport Randomization
-            const randomWidth = 1920 + Math.floor(Math.random() * 50);
-            const randomHeight = 1080 + Math.floor(Math.random() * 50);
+            const fingerprintProfile = this._getFingerprintProfile(authIndex);
+
+            // Keep viewport slightly randomized while preserving a consistent device profile.
+            const viewportInsetX = Math.floor(Math.random() * 121);
+            const viewportInsetY = 72 + Math.floor(Math.random() * 89);
+            const randomWidth = Math.max(1280, fingerprintProfile.screen.width - viewportInsetX);
+            const randomHeight = Math.max(720, fingerprintProfile.screen.height - viewportInsetY);
 
             // Check abort status before expensive operations
             if (this.abortedContexts.has(authIndex) || (isBackgroundTask && this._backgroundPreloadAbort)) {
                 throw new ContextAbortedError(authIndex, "marked for deletion");
             }
 
-            // Launch a dedicated Firefox process for this account (or reuse the
-            // existing one if it was already launched). Each browser sees only
-            // its own single newContext/newPage call, so the Camoufox
-            // concurrent-newContext deadlock that used to require shared-lock
-            // serialization is no longer reachable — every browser is its own
-            // serialization domain.
+            // Each account owns a dedicated Firefox process, so newContext is
+            // serialized within its own browser and the Camoufox concurrent-
+            // newContext deadlock is unreachable. fingerprintProfile drives
+            // device, locale and headers so every context's identity matches
+            // the spoof injected via the privacy init script.
             const accountBrowser = await this._ensureBrowserFor(authIndex);
 
-            // Check abort status after launch
             if (this.abortedContexts.has(authIndex) || (isBackgroundTask && this._backgroundPreloadAbort)) {
                 throw new ContextAbortedError(authIndex, "marked for deletion");
             }
 
             this.logger.debug(`[Context#${authIndex}] Creating browser context...`);
             context = await accountBrowser.newContext({
-                deviceScaleFactor: 1,
+                deviceScaleFactor: fingerprintProfile.devicePixelRatio,
+                extraHTTPHeaders: { "Accept-Language": fingerprintProfile.acceptLanguage },
+                hasTouch: fingerprintProfile.maxTouchPoints > 0,
+                isMobile: fingerprintProfile.mobile,
+                locale: fingerprintProfile.locale,
+                screen: fingerprintProfile.screen,
                 storageState: storageStateObject,
+                userAgent: fingerprintProfile.userAgent,
                 viewport: { height: randomHeight, width: randomWidth },
                 ...(proxyConfig ? { proxy: proxyConfig } : {}),
             });
